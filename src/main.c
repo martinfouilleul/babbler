@@ -53,6 +53,29 @@ enum
     SIDE_PANEL_WIDTH = 150,
 };
 
+typedef enum
+{
+    BB_CELL_LIST,
+    BB_CELL_SYMBOL,
+
+} bb_cell_kind;
+
+typedef struct bb_cell bb_cell;
+
+struct bb_cell
+{
+    oc_list_elt parentElt;
+    bb_cell* parent;
+    oc_list children;
+    u32 childCount;
+
+    u64 id;
+    bb_cell_kind kind;
+    oc_str8 text;
+
+    oc_rect rect;
+};
+
 typedef struct bb_card
 {
     oc_list_elt listElt;
@@ -60,7 +83,232 @@ typedef struct bb_card
     u32 id;
     oc_rect rect;
     oc_rect displayRect;
+
+    bb_cell* root;
 } bb_card;
+
+bool bb_cell_has_children(bb_cell* cell)
+{
+    return (cell->kind == BB_CELL_LIST);
+}
+
+bool bb_cell_has_text(bb_cell* cell)
+{
+    return (cell->kind == BB_CELL_SYMBOL);
+}
+
+typedef struct bb_cell_editor
+{
+    f32 spaceWidth;
+    f32 lineHeight;
+
+    oc_font font;
+    f32 fontSize;
+    oc_font_metrics fontMetrics;
+
+} bb_cell_editor;
+
+typedef struct cell_layout_options
+{
+    bool vertical;
+} cell_layout_options;
+
+cell_layout_options cell_get_layout_options(bb_cell* cell)
+{
+    cell_layout_options result = { 0 };
+
+    if(cell->kind == BB_CELL_LIST)
+    {
+        if(!cell->parent)
+        {
+            //root
+            result = (cell_layout_options){
+                .vertical = true,
+            };
+        }
+        //...
+    }
+    //...
+
+    return (result);
+}
+
+typedef struct cell_layout_result
+{
+    oc_rect rect;
+    f32 lastLineWidth;
+    bool vertical;
+
+} cell_layout_result;
+
+cell_layout_result cell_update_layout(bb_cell_editor* editor, bb_cell* cell, oc_vec2 pos)
+{
+    cell_layout_result result = {
+        .rect = {
+            .x = pos.x,
+            .y = pos.y,
+            .w = 0,
+            .h = editor->lineHeight,
+        },
+    };
+
+    if(bb_cell_has_text(cell))
+    {
+        oc_str8 text = OC_STR8(" ");
+        if(cell->text.len)
+        {
+            text = cell->text;
+        }
+        oc_text_metrics metrics = oc_font_text_metrics(editor->font, editor->fontSize, text);
+
+        result.rect.w = metrics.logical.w;
+
+        //        result.rect.w += bb_cell_left_decorator_width(editor, cell);
+        //        result.rect.w += bb_cell_right_decorator_width(editor, cell);
+    }
+    else if(bb_cell_has_children(cell))
+    {
+        //NOTE: first compute dimension of children and layout horizontally
+        oc_arena_scope scratch = oc_scratch_begin();
+
+        cell_layout_result* childResults = oc_arena_push_array(scratch.arena, cell_layout_result, cell->childCount);
+        u32 childIndex = 0;
+        oc_vec2 childPos = { 0 };
+        oc_list_for(cell->children, child, bb_cell, parentElt)
+        {
+            childResults[childIndex] = cell_update_layout(editor, child, childPos);
+            childPos.x += childResults[childIndex].rect.w;
+
+            result.rect.w += childResults[childIndex].rect.w;
+
+            if(child != oc_list_last_entry(cell->children, bb_cell, parentElt))
+            {
+                result.rect.w += editor->spaceWidth;
+                childPos.x += editor->spaceWidth;
+            }
+            result.rect.h = oc_max(result.rect.h, childResults[childIndex].rect.h);
+            result.vertical = result.vertical || childResults[childIndex].vertical;
+
+            childIndex++;
+        }
+
+        cell_layout_options options = cell_get_layout_options(cell);
+        result.rect.w = 0;
+        result.rect.h = 0;
+
+        if(options.vertical || result.vertical) //TODO: max child etc
+        {
+            //NOTE: relayout vertically
+
+            childPos = (oc_vec2){ 0 };
+            oc_list_for(cell->children, child, bb_cell, parentElt)
+            {
+                child->rect.x = childPos.x;
+                child->rect.y = childPos.y;
+                childPos.y += editor->lineHeight;
+
+                result.rect.w = oc_max(result.rect.w, child->rect.w);
+                result.rect.h += child->rect.h;
+            }
+        }
+
+        oc_scratch_end(scratch);
+    }
+    cell->rect = result.rect;
+
+    return result;
+}
+
+void cell_update_rects(bb_cell* cell, oc_vec2 pos)
+{
+    cell->rect.x += pos.x;
+    cell->rect.y += pos.y;
+
+    oc_list_for(cell->children, child, bb_cell, parentElt)
+    {
+        cell_update_rects(child, (oc_vec2){ cell->rect.x, cell->rect.y });
+    }
+}
+
+typedef struct bb_box_draw_proc_data
+{
+    bb_cell_editor* editor;
+    bb_cell* cell;
+
+} bb_box_draw_proc_data;
+
+void bb_box_draw_proc(oc_ui_box* box, void* usr)
+{
+    bb_box_draw_proc_data* data = (bb_box_draw_proc_data*)usr;
+    bb_cell* cell = data->cell;
+    bb_cell_editor* editor = data->editor;
+
+    /*
+    if(cell->id == 0)
+    {
+        oc_set_color_rgba(1, 1, 1, 1);
+    }
+    else if(cell->id == 1)
+    {
+        oc_set_color_rgba(1, 0, 0, 1);
+    }
+    else if(cell->id == 2)
+    {
+        oc_set_color_rgba(0, 1, 0, 1);
+    }
+    else if(cell->id == 3)
+    {
+        oc_set_color_rgba(0, 0, 1, 1);
+    }
+    else
+    {
+        oc_set_color_rgba(1, 0, 1, 1);
+    }
+
+    oc_set_width(1);
+    oc_rectangle_stroke(box->rect.x, box->rect.y, box->rect.w, box->rect.h);
+    */
+
+    if(cell->text.len)
+    {
+        oc_set_font(editor->font);
+        oc_set_font_size(editor->fontSize);
+
+        oc_move_to(box->rect.x, box->rect.y + editor->fontMetrics.ascent);
+        oc_text_outlines(cell->text);
+
+        oc_set_color_rgba(1, 1, 1, 1);
+        oc_fill();
+    }
+}
+
+void build_cell_ui(oc_arena* arena, bb_cell_editor* editor, bb_cell* cell)
+{
+    oc_arena_scope scratch = oc_scratch_begin_next(arena);
+    oc_str8 key = oc_str8_pushf(scratch.arena, "cell-%u", cell->id);
+
+    oc_ui_style_next(&(oc_ui_style){
+                         .floating = { true, true },
+                         .floatTarget = { cell->rect.x, cell->rect.y },
+                         .size.width = { OC_UI_SIZE_PIXELS, cell->rect.w },
+                         .size.height = { OC_UI_SIZE_PIXELS, cell->rect.h },
+                     },
+                     OC_UI_STYLE_SIZE | OC_UI_STYLE_FLOAT);
+
+    oc_ui_box* box = oc_ui_box_make_str8(key, OC_UI_FLAG_DRAW_PROC);
+
+    bb_box_draw_proc_data* data = oc_arena_push_type(arena, bb_box_draw_proc_data);
+    data->cell = cell;
+    data->editor = editor;
+    oc_ui_box_set_draw_proc(box, bb_box_draw_proc, data);
+
+    oc_scratch_end(scratch);
+
+    oc_list_for(cell->children, child, bb_cell, parentElt)
+    {
+        build_cell_ui(arena, editor, child);
+    }
+}
 
 int main()
 {
@@ -162,6 +410,72 @@ int main()
     oc_list_push_back(&middleList, &cards[5].listElt);
     oc_list_push_back(&middleList, &cards[6].listElt);
     oc_list_push_back(&middleList, &cards[7].listElt);
+
+    oc_arena arena = { 0 };
+    oc_arena_init(&arena);
+
+    bb_cell* root = oc_arena_push_type(&arena, bb_cell);
+    memset(root, 0, sizeof(bb_cell));
+    root->id = 0;
+    root->kind = BB_CELL_LIST;
+
+    bb_cell* whenList = oc_arena_push_type(&arena, bb_cell);
+    memset(whenList, 0, sizeof(bb_cell));
+    whenList->id = 1;
+    whenList->parent = root;
+    oc_list_push_back(&root->children, &whenList->parentElt);
+    root->childCount++;
+    whenList->kind = BB_CELL_LIST;
+
+    bb_cell* when = oc_arena_push_type(&arena, bb_cell);
+    memset(when, 0, sizeof(bb_cell));
+    when->id = 2;
+    when->parent = whenList;
+    oc_list_push_back(&whenList->children, &when->parentElt);
+    whenList->childCount++;
+    when->kind = BB_CELL_SYMBOL;
+    when->text = OC_STR8("when");
+
+    bb_cell* claimList = oc_arena_push_type(&arena, bb_cell);
+    memset(claimList, 0, sizeof(bb_cell));
+    claimList->id = 3;
+    claimList->parent = root;
+    oc_list_push_back(&root->children, &claimList->parentElt);
+    root->childCount++;
+    claimList->kind = BB_CELL_LIST;
+
+    bb_cell* claim = oc_arena_push_type(&arena, bb_cell);
+    memset(claim, 0, sizeof(bb_cell));
+    claim->id = 4;
+    claim->parent = claimList;
+    oc_list_push_back(&claimList->children, &claim->parentElt);
+    claimList->childCount++;
+    claim->kind = BB_CELL_SYMBOL;
+    claim->text = OC_STR8("claim");
+
+    bb_cell* self = oc_arena_push_type(&arena, bb_cell);
+    memset(self, 0, sizeof(bb_cell));
+    self->id = 5;
+    self->parent = claimList;
+    oc_list_push_back(&claimList->children, &self->parentElt);
+    claimList->childCount++;
+    self->kind = BB_CELL_SYMBOL;
+    self->text = OC_STR8("self");
+
+    cards[7].root = root;
+
+    f32 cardAnimationTimeConstant = 0.2;
+
+    oc_font_metrics metrics = oc_font_get_metrics(font, 14);
+    oc_text_metrics spaceMetrics = oc_font_text_metrics(font, 14, OC_STR8(" "));
+
+    bb_cell_editor editor = {
+        .font = font,
+        .fontSize = 14,
+        .fontMetrics = metrics,
+        .lineHeight = metrics.ascent + metrics.descent + metrics.lineGap,
+        .spaceWidth = spaceMetrics.logical.w,
+    };
 
     while(!oc_should_quit())
     {
@@ -375,6 +689,16 @@ int main()
                                                          | OC_UI_FLAG_BLOCK_MOUSE)
                                 {
                                     oc_ui_label_str8(key);
+
+                                    oc_ui_container("cells", 0)
+                                    {
+                                        if(card->root)
+                                        {
+                                            cell_update_layout(&editor, card->root, (oc_vec2){ 10, 20 });
+                                            cell_update_rects(card->root, (oc_vec2){ 0 });
+                                            build_cell_ui(scratch.arena, &editor, card->root);
+                                        }
+                                    }
                                 }
                             }
                         }
@@ -446,8 +770,8 @@ int main()
                                     y += thumbnailSize + spacing;
                                 }
 
-                                card->displayRect.x += 0.1 * (x - card->displayRect.x);
-                                card->displayRect.y += 0.1 * (y - card->displayRect.y);
+                                card->displayRect.x += cardAnimationTimeConstant * (x - card->displayRect.x);
+                                card->displayRect.y += cardAnimationTimeConstant * (y - card->displayRect.y);
                                 card->displayRect.w = 100;
                                 card->displayRect.h = 100;
 
@@ -510,13 +834,13 @@ int main()
 
                     if(thumbnailed)
                     {
-                        dragging->displayRect.w += 0.1 * (100 - dragging->displayRect.w);
-                        dragging->displayRect.h += 0.1 * (100 - dragging->displayRect.h);
+                        dragging->displayRect.w += cardAnimationTimeConstant * (100 - dragging->displayRect.w);
+                        dragging->displayRect.h += cardAnimationTimeConstant * (100 - dragging->displayRect.h);
                     }
                     else
                     {
-                        dragging->displayRect.w += 0.1 * (dragging->rect.w - dragging->displayRect.w);
-                        dragging->displayRect.h += 0.1 * (dragging->rect.h - dragging->displayRect.h);
+                        dragging->displayRect.w += cardAnimationTimeConstant * (dragging->rect.w - dragging->displayRect.w);
+                        dragging->displayRect.h += cardAnimationTimeConstant * (dragging->rect.h - dragging->displayRect.h);
                     }
 
                     oc_ui_style_next(&(oc_ui_style){
