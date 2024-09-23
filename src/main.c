@@ -55,6 +55,7 @@ enum
 
 typedef enum
 {
+    BB_CELL_HOLE,
     BB_CELL_LIST,
     BB_CELL_SYMBOL,
 
@@ -74,6 +75,7 @@ struct bb_cell
     oc_str8 text;
 
     oc_rect rect;
+    f32 lastLineWidth;
 };
 
 typedef struct bb_card
@@ -97,6 +99,14 @@ bool bb_cell_has_text(bb_cell* cell)
     return (cell->kind == BB_CELL_SYMBOL);
 }
 
+typedef struct bb_point
+{
+    bb_cell* parent;
+    bb_cell* leftFrom;
+    u32 offset;
+
+} bb_point;
+
 typedef struct bb_cell_editor
 {
     f32 spaceWidth;
@@ -106,7 +116,512 @@ typedef struct bb_cell_editor
     f32 fontSize;
     oc_font_metrics fontMetrics;
 
+    bb_card* editedCard;
+    bb_point cursor;
+    bb_point mark;
+
 } bb_cell_editor;
+
+//------------------------------------------------------------------------------------------
+// bb_point helpers
+//------------------------------------------------------------------------------------------
+bool bb_point_same_cell(bb_point a, bb_point b)
+{
+    return (a.parent == b.parent
+            && a.leftFrom == b.leftFrom);
+}
+
+bool bb_point_equal(bb_point a, bb_point b)
+{
+    return (a.parent == b.parent
+            && a.leftFrom == b.leftFrom
+            && a.offset == b.offset);
+}
+
+bb_cell* bb_point_left_cell(bb_point point)
+{
+    return (point.leftFrom ? oc_list_prev_entry(point.parent->children, point.leftFrom, bb_cell, parentElt)
+                           : oc_list_last_entry(point.parent->children, bb_cell, parentElt));
+}
+
+bb_cell* bb_point_right_cell(bb_point point)
+{
+    return (point.leftFrom ? point.leftFrom : 0);
+}
+
+bb_point bb_prev_point(bb_point point)
+{
+    if(bb_cell_has_text(point.parent)
+       && point.offset > 0)
+    {
+        point.offset = oc_utf8_prev_offset(point.parent->text, point.offset);
+    }
+    else
+    {
+        bb_cell* leftSibling = bb_point_left_cell(point);
+        if(leftSibling)
+        {
+            if(bb_cell_has_children(leftSibling)
+               || bb_cell_has_text(leftSibling))
+            {
+                //NOTE(martin): new point is at the end of the left sibling's children list
+                point.leftFrom = 0;
+                point.parent = leftSibling;
+
+                if(point.parent->kind == BB_CELL_HOLE)
+                {
+                    point.offset = 0;
+                }
+                else
+                {
+                    point.offset = point.parent->text.len;
+                }
+            }
+            else
+            {
+                //NOTE(martin): new point is before left sibling
+                point.leftFrom = leftSibling;
+            }
+        }
+        else if(point.parent->parent)
+        {
+            //NOTE(martin): new point is before the parent
+            point.leftFrom = point.parent;
+            point.parent = point.parent->parent;
+            point.offset = 0;
+        }
+    }
+    return (point);
+}
+
+#define bb_cell_first_child(parent) oc_list_first_entry(((parent)->children), bb_cell, parentElt)
+#define bb_cell_last_child(parent) oc_list_last_entry(((parent)->children), bb_cell, parentElt)
+#define bb_cell_next_sibling(cell) oc_list_next_entry(((cell)->parent->children), (cell), bb_cell, parentElt)
+#define bb_cell_prev_sibling(cell) oc_list_prev_entry(((cell)->parent->children), (cell), bb_cell, parentElt)
+
+bb_point bb_next_point(bb_point point)
+{
+    if(bb_cell_has_text(point.parent)
+       && point.offset < point.parent->text.len
+       && point.parent->kind != BB_CELL_HOLE)
+    {
+        point.offset = oc_utf8_next_offset(point.parent->text, point.offset);
+    }
+    else if(point.leftFrom)
+    {
+        if(bb_cell_has_children(point.leftFrom)
+           || bb_cell_has_text(point.leftFrom))
+        {
+            //NOTE(martin): new point is at the begining of right sibling
+            point.parent = point.leftFrom;
+            point.leftFrom = bb_cell_first_child(point.leftFrom);
+            point.offset = 0;
+        }
+        else
+        {
+            //NOTE(martin): next point is after right sibling
+            point.leftFrom = bb_cell_next_sibling(point.leftFrom);
+        }
+    }
+    else if(point.parent->parent)
+    {
+        //NOTE(martin): new point is after parent
+        point.leftFrom = bb_cell_next_sibling(point.parent);
+        point.parent = point.parent->parent;
+        point.offset = 0;
+    }
+    return (point);
+}
+
+oc_rect bb_cell_contents_box(bb_cell_editor* editor, bb_cell* cell)
+{
+    oc_rect r = cell->rect;
+
+    /*
+    f32 leftDecoratorW = bb_cell_left_decorator_width(editor, cell);
+    f32 rightDecoratorW = bb_cell_right_decorator_width(editor, cell);
+    r.x += leftDecoratorW;
+    r.w -= (leftDecoratorW + rightDecoratorW);
+
+    if(cell->box.w > cell->lastLineWidth)
+    {
+        r.w = cell->box.x + cell->box.w - r.x;
+    }
+    */
+    return (r);
+}
+
+//------------------------------------------------------------------------------------------
+// point <-> display
+//------------------------------------------------------------------------------------------
+
+f32 bb_display_offset_for_text_index(bb_cell_editor* editor, oc_str8 text, u32 offset)
+{
+    oc_str8 leftText = oc_str8_slice(text, 0, offset);
+    oc_text_metrics metrics = oc_font_text_metrics(editor->font, editor->fontSize, leftText);
+    return (metrics.logical.w);
+}
+
+oc_vec2 bb_point_to_display_pos(bb_cell_editor* editor, bb_point point)
+{
+    f32 lineHeight = editor->lineHeight;
+    oc_vec2 cursorPos = { 0 };
+
+    if(point.leftFrom)
+    {
+        cursorPos.x = point.leftFrom->rect.x;
+        cursorPos.y = point.leftFrom->rect.y;
+    }
+    else if(bb_cell_has_text(point.parent))
+    {
+        oc_rect box = bb_cell_contents_box(editor, point.parent);
+        cursorPos.x = box.x + bb_display_offset_for_text_index(editor, point.parent->text, point.offset);
+        cursorPos.y = box.y;
+    }
+    else if(!oc_list_empty(point.parent->children))
+    {
+        bb_cell* leftSibling = oc_list_last_entry(point.parent->children, bb_cell, parentElt);
+        cursorPos.x = leftSibling->rect.x + leftSibling->lastLineWidth;
+        cursorPos.y = leftSibling->rect.y + leftSibling->rect.h - lineHeight;
+    }
+    else
+    {
+        oc_rect box = bb_cell_contents_box(editor, point.parent);
+        cursorPos.x = box.x;
+        cursorPos.y = box.y;
+    }
+    return (cursorPos);
+}
+
+//------------------------------------------------------------------------------------------
+// Moves
+//------------------------------------------------------------------------------------------
+typedef enum
+{
+    BB_PREV,
+    BB_NEXT
+} bb_direction;
+
+void bb_move_one(bb_cell_editor* editor, bb_direction direction)
+{
+    editor->cursor = (direction == BB_PREV)
+                       ? bb_prev_point(editor->cursor)
+                       : bb_next_point(editor->cursor);
+}
+
+void bb_move_vertical(bb_cell_editor* editor, bb_direction direction)
+{
+    //NOTE(martin): intercept vertical moves if completion panel is focused
+    /*
+    if(editor->completionPanel.active)
+    {
+        return;
+    }
+    */
+
+    //NOTE(martin): we need to get the x coordinate of the current cursor, then move to next/prev until we find a box
+    bb_point point = editor->cursor;
+    oc_vec2 oldCursorPos = bb_point_to_display_pos(editor, point);
+    oc_vec2 cursorPos = oldCursorPos;
+    f32 lineY = cursorPos.y;
+    u32 lineCount = 0;
+
+    //TODO: use boxes broad phase first, don't call prev/next point each time?
+    while(1)
+    {
+        bb_point oldPoint = point;
+
+        point = (direction == BB_PREV) ? bb_prev_point(point) : bb_next_point(point);
+
+        if(bb_point_equal(oldPoint, point))
+        {
+            editor->cursor = point;
+            break;
+        }
+        cursorPos = bb_point_to_display_pos(editor, point);
+
+        if((direction == BB_PREV && cursorPos.y < lineY)
+           || (direction == BB_NEXT && cursorPos.y > lineY))
+        {
+            lineY = cursorPos.y;
+            lineCount++;
+        }
+
+        if(lineCount > 1)
+        {
+            editor->cursor = oldPoint;
+            break;
+        }
+
+        bool condition = (direction == BB_PREV) ? (cursorPos.y < oldCursorPos.y && cursorPos.x <= oldCursorPos.x) : (cursorPos.y > oldCursorPos.y && cursorPos.x >= oldCursorPos.x);
+
+        if(condition)
+        {
+            editor->cursor = point;
+            break;
+        }
+    }
+}
+
+typedef void (*bb_move)(bb_cell_editor* editor, bb_direction direction);
+typedef void (*bb_action)(bb_cell_editor* editor);
+
+typedef struct bb_command
+{
+    oc_key_code key;
+    oc_utf32 codePoint;
+    oc_keymod_flags mods;
+
+    bb_move move;
+    bb_direction direction;
+    bool setMark;
+
+    bb_action action;
+    bool focusCursor;
+    bool rebuild;
+    bool updateCompletion;
+
+} bb_command;
+
+const bb_command BB_COMMANDS[] = {
+    //NOTE(martin): move
+    {
+        .key = OC_KEY_LEFT,
+        .move = bb_move_one,
+        .direction = BB_PREV,
+        .setMark = true,
+    },
+    {
+        .key = OC_KEY_RIGHT,
+        .move = bb_move_one,
+        .direction = BB_NEXT,
+        .setMark = true,
+    },
+    {
+        .key = OC_KEY_UP,
+        .move = bb_move_vertical,
+        .direction = BB_PREV,
+        .setMark = true,
+    },
+    {
+        .key = OC_KEY_DOWN,
+        .move = bb_move_vertical,
+        .direction = BB_NEXT,
+        .setMark = true,
+    },
+    /*
+	//NOTE(martin): move select
+	{
+		.key = OC_KEY_LEFT,
+		.mods = OC_KEYMOD_SHIFT,
+		.move = bb_move_one,
+		.direction = BB_PREV,
+	},
+	{
+		.key = OC_KEY_RIGHT,
+		.mods = OC_KEYMOD_SHIFT,
+		.move = bb_move_one,
+		.direction = BB_NEXT,
+	},
+	{
+		.key = OC_KEY_UP,
+		.mods = OC_KEYMOD_SHIFT,
+		.move = bb_move_vertical,
+		.direction = BB_PREV,
+	},
+	{
+		.key = OC_KEY_DOWN,
+		.mods = OC_KEYMOD_SHIFT,
+		.move = bb_move_vertical,
+		.direction = BB_NEXT,
+	},
+	//NOTE(martin): cells insertion
+	{
+		.key = OC_KEY_PERIOD,
+		.mods = OC_KEYMOD_CMD,
+		.action = bb_insert_comment,
+		.rebuild = true,
+		.focusCursor = true,
+	},
+	{
+		.codePoint = '(',
+		.action = bb_insert_list,
+		.rebuild = true,
+		.updateCompletion = true,
+		.focusCursor = true,
+	},
+	{
+		.codePoint = '[',
+		.action = bb_insert_array,
+		.rebuild = true,
+		.updateCompletion = true,
+		.focusCursor = true,
+	},
+	{
+		.codePoint = ' ',
+		.action = bb_insert_placeholder,
+		.rebuild = true,
+		.updateCompletion = true,
+		.focusCursor = true,
+	},
+	{
+		.codePoint = '\"',
+		.action = bb_insert_string_literal,
+		.rebuild = true,
+		.updateCompletion = true,
+		.focusCursor = true,
+	},
+	{
+		.codePoint = '\'',
+		.action = bb_insert_char_literal,
+		.rebuild = true,
+		.updateCompletion = true,
+		.focusCursor = true,
+	},
+	{
+		.codePoint = '@',
+		.action = bb_insert_attr,
+		.rebuild = true,
+		.updateCompletion = true,
+		.focusCursor = true,
+	},
+	{
+		.codePoint = '#',
+		.action = bb_insert_ui,
+		.rebuild = true,
+		.updateCompletion = true,
+		.focusCursor = true,
+	},
+
+	{
+		.key = OC_KEY_5,
+		.mods = OC_KEYMOD_CMD,
+		.action = bb_parenthesize_span,
+		.rebuild = true,
+		.updateCompletion = true,
+		.focusCursor = true,
+	},
+
+	//NOTE(martin): deletion
+	{
+		.key = OC_KEY_BACKSPACE,
+		.move = bb_move_one,
+		.direction = BB_PREV,
+		.action = bb_delete,
+		.rebuild = true,
+		.updateCompletion = true,
+		.focusCursor = true,
+	},
+
+	//NOTE(martin): copy/paste
+	{
+		.key = OC_KEY_C,
+		.mods = OC_KEYMOD_CMD,
+		.action = bb_copy,
+	},
+	{
+		.key = OC_KEY_X,
+		.mods = OC_KEYMOD_CMD,
+		.action = bb_cut,
+		.focusCursor = true,
+	},
+	{
+		.key = OC_KEY_V,
+		.mods = OC_KEYMOD_CMD,
+		.action = bb_paste,
+		.rebuild = true,
+		.focusCursor = true,
+	},
+
+	//NOTE(martin): tree selection commands
+	{
+		.key = OC_KEY_N,
+		.mods = OC_KEYMOD_CMD,
+		.action = bb_tab_open_transient,
+	},
+	{
+		.key = OC_KEY_N,
+		.mods = OC_KEYMOD_CTRL,
+		.action = bb_tab_select_next,
+	},
+	{
+		.key = OC_KEY_K,
+		.mods = OC_KEYMOD_CMD,
+		.action = bb_tab_close_current,
+	},
+	{
+		.key = OC_KEY_N,
+		.mods = OC_KEYMOD_CTRL | OC_KEYMOD_SHIFT,
+		.action = bb_select_next_build_module,
+	},
+
+	//NOTE(martin): print completion list
+	{
+		.key = OC_KEY_TAB,
+		.action = bb_completion_activate,
+	},
+	*/
+};
+
+const u32 BB_COMMAND_COUNT = sizeof(BB_COMMANDS) / sizeof(bb_command);
+
+void bb_run_command(bb_cell_editor* editor, const bb_command* command)
+{
+    if(command->move)
+    {
+        /*
+        //NOTE(martin): we special case delete here, so that we don't move if we're deleting a selection
+        if(command->action == bb_delete)
+        {
+            if(bb_point_equal(editor->cursor, editor->mark))
+            {
+                if(!cell_has_text(editor->cursor.parent))
+                {
+                    //NOTE(martin): select cells first before deleting them
+                    command->move(editor, command->direction);
+                    return;
+                }
+            }
+            else
+            {
+                bb_delete(editor);
+                goto rebuild;
+                return;
+            }
+        }
+        */
+
+        command->move(editor, command->direction);
+        if(command->setMark)
+        {
+            editor->mark = editor->cursor;
+        }
+    }
+
+    if(command->action)
+    {
+        command->action(editor);
+    }
+
+    if(command->move || command->focusCursor)
+    {
+        //        editor->scrollToCursorOnNextFrame = true; //NOTE(martin): requests to constrain scroll to cursor on next frame
+        //        bb_reset_cursor_blink(editor);
+    }
+
+rebuild:
+    if(command->rebuild)
+    {
+        //        bb_rebuild(editor);
+    }
+
+    if(command->updateCompletion)
+    {
+        //        bb_completion_update(editor);
+    }
+}
+
+//---------------------------------------------------------
 
 typedef struct cell_layout_options
 {
@@ -162,6 +677,8 @@ cell_layout_result cell_update_layout(bb_cell_editor* editor, bb_cell* cell, oc_
         oc_text_metrics metrics = oc_font_text_metrics(editor->font, editor->fontSize, text);
 
         result.rect.w = metrics.logical.w;
+        result.lastLineWidth = metrics.logical.w;
+        cell->lastLineWidth = metrics.logical.w;
 
         //        result.rect.w += bb_cell_left_decorator_width(editor, cell);
         //        result.rect.w += bb_cell_right_decorator_width(editor, cell);
@@ -191,14 +708,15 @@ cell_layout_result cell_update_layout(bb_cell_editor* editor, bb_cell* cell, oc_
 
             childIndex++;
         }
+        result.lastLineWidth = result.rect.w;
 
         cell_layout_options options = cell_get_layout_options(cell);
-        result.rect.w = 0;
-        result.rect.h = 0;
 
         if(options.vertical || result.vertical) //TODO: max child etc
         {
             //NOTE: relayout vertically
+            result.rect.w = 0;
+            result.rect.h = 0;
 
             childPos = (oc_vec2){ 0 };
             oc_list_for(cell->children, child, bb_cell, parentElt)
@@ -210,11 +728,13 @@ cell_layout_result cell_update_layout(bb_cell_editor* editor, bb_cell* cell, oc_
                 result.rect.w = oc_max(result.rect.w, child->rect.w);
                 result.rect.h += child->rect.h;
             }
+            result.lastLineWidth = childPos.x;
         }
 
         oc_scratch_end(scratch);
     }
     cell->rect = result.rect;
+    cell->lastLineWidth = result.lastLineWidth;
 
     return result;
 }
@@ -308,6 +828,135 @@ void build_cell_ui(oc_arena* arena, bb_cell_editor* editor, bb_cell* cell)
     {
         build_cell_ui(arena, editor, child);
     }
+}
+
+void bb_draw_cursor(bb_cell_editor* editor)
+{
+    oc_vec2 cursorPos = bb_point_to_display_pos(editor, editor->cursor);
+
+    oc_set_color_rgba(0.95, 0.71, 0.25, 1);
+    oc_rectangle_fill(cursorPos.x - 2, cursorPos.y, 4, editor->lineHeight);
+}
+
+void bb_draw_sibling_marker(bb_cell_editor* editor, bb_cell* cell, oc_color color)
+{
+    f32 lineHeight = editor->lineHeight;
+
+    oc_set_color(color);
+    oc_set_width(4);
+    oc_move_to(cell->rect.x, cell->rect.y + cell->rect.h - 2);
+    oc_line_to(cell->rect.x + cell->lastLineWidth, cell->rect.y + cell->rect.h - 2);
+    oc_stroke();
+}
+
+void bb_draw_edit_range(bb_cell_editor* editor)
+{
+    f32 spaceWidth = editor->spaceWidth;
+    f32 lineHeight = editor->lineHeight;
+
+    bb_point cursor = editor->cursor;
+    bb_point mark = editor->mark;
+
+    if(!bb_point_same_cell(cursor, mark))
+    {
+        /*
+        //NOTE(martin): multiple nodes are selected, highlight the selection (in blue)
+        bb_cell_span span = bb_cell_span_from_points(cursor, mark);
+        q_cell* parent = span.start->parent;
+        q_cell* stop = cell_next_sibling(span.end);
+
+        mp_aligned_rect startBox = bb_cell_frame_box(span.start);
+        mp_aligned_rect box = startBox;
+        mp_aligned_rect endBox = startBox;
+
+        for(q_cell* cell = span.start; cell != stop; cell = cell_next_sibling(cell))
+        {
+            endBox = bb_cell_frame_box(cell);
+            box = bb_combined_box(box, endBox);
+        }
+
+        mp_aligned_rect firstLine = { startBox.x,
+                                      startBox.y,
+                                      maximum(0, box.x + box.w - startBox.x),
+                                      lineHeight };
+
+        mp_aligned_rect innerSpan = { box.x,
+                                      box.y + lineHeight,
+                                      box.w,
+                                      maximum(0, box.h - 2 * lineHeight) };
+
+        mp_aligned_rect lastLine = { box.x,
+                                     box.y + box.h - lineHeight,
+                                     maximum(0, endBox.x + endBox.w - box.x),
+                                     maximum(0, endBox.y + endBox.h - (box.y + box.h - lineHeight)) };
+
+        mp_graphics_set_color_rgba(graphics, 0.2, 0.2, 1, 1);
+
+        mp_graphics_rectangle_fill(graphics, firstLine.x, firstLine.y, firstLine.w, firstLine.h);
+        mp_graphics_rectangle_fill(graphics, innerSpan.x, innerSpan.y, innerSpan.w, innerSpan.h);
+        mp_graphics_rectangle_fill(graphics, lastLine.x, lastLine.y, lastLine.w, lastLine.h);
+
+        bb_draw_cursor(gui, editor);
+        */
+    }
+    else
+    {
+        //NOTE(martin): shade the parent cell of cursor/mark
+        oc_rect parentBox = bb_cell_contents_box(editor, cursor.parent);
+        oc_set_color_rgba(0.2, 0.2, 0.2, 1);
+        oc_rectangle_fill(parentBox.x, parentBox.y, parentBox.w, parentBox.h);
+
+        if(!cursor.leftFrom
+           && (bb_cell_has_text(cursor.parent))
+           && cursor.offset != mark.offset)
+        {
+            //NOTE(martin): some text is selected. Highlight the selection (in blue).
+            oc_rect box = bb_cell_contents_box(editor, cursor.parent);
+
+            u64 start = oc_min(cursor.offset, mark.offset);
+            u64 end = oc_max(cursor.offset, mark.offset);
+
+            oc_str8 string = cursor.parent->text;
+            oc_rect leftBox = oc_font_text_metrics(editor->font, editor->fontSize, oc_str8_slice(string, 0, start)).logical;
+            oc_rect selBox = oc_font_text_metrics(editor->font, editor->fontSize, oc_str8_slice(string, start, end)).logical;
+
+            selBox.x += box.x + leftBox.w;
+            selBox.y = box.y;
+
+            oc_set_color_rgba(0.2, 0.2, 1, 1);
+            oc_rectangle_fill(selBox.x, selBox.y, selBox.w, selBox.h);
+
+            //  editor->animatedCursor = bb_point_to_display_pos(editor, tab->cursor);
+        }
+        else
+        {
+            bb_draw_cursor(editor);
+        }
+    }
+    //NOTE(martin): underline cells to the left/right of cursor
+    bb_cell* leftSibling = bb_point_left_cell(cursor);
+    bb_cell* rightSibling = bb_point_right_cell(cursor);
+
+    if(leftSibling)
+    {
+        bb_draw_sibling_marker(editor, leftSibling, (oc_color){ 0.2, 0.5, 1, 1 });
+    }
+    if(rightSibling)
+    {
+        bb_draw_sibling_marker(editor, rightSibling, (oc_color){ 0, 1, 0, 1 });
+    }
+}
+
+void bb_editor_draw_proc(oc_ui_box* box, void* data)
+{
+    bb_cell_editor* editor = (bb_cell_editor*)data;
+
+    oc_matrix_push((oc_mat2x3){
+        1, 0, box->rect.x,
+        0, 1, box->rect.y });
+
+    bb_draw_edit_range(editor);
+    oc_matrix_pop();
 }
 
 int main()
@@ -475,6 +1124,18 @@ int main()
         .fontMetrics = metrics,
         .lineHeight = metrics.ascent + metrics.descent + metrics.lineGap,
         .spaceWidth = spaceMetrics.logical.w,
+
+        .editedCard = &cards[7],
+        .cursor = {
+            .parent = self,
+            .leftFrom = 0,
+            .offset = 3,
+        },
+        .mark = {
+            .parent = self,
+            .leftFrom = 0,
+            .offset = 3,
+        },
     };
 
     while(!oc_should_quit())
@@ -502,6 +1163,22 @@ int main()
 
                 default:
                     break;
+            }
+        }
+
+        //NOTE(martin): handle keyboard shortcuts
+        bool runCommand = false;
+        oc_keymod_flags mods = oc_key_mods(&ui.input);
+        for(int i = 0; i < BB_COMMAND_COUNT; i++)
+        {
+            const bb_command* command = &(BB_COMMANDS[i]);
+
+            if(oc_key_press_count(&ui.input, command->key)
+               && command->mods == mods)
+            {
+                bb_run_command(&editor, command);
+                runCommand = true;
+                break;
             }
         }
 
@@ -690,7 +1367,7 @@ int main()
                                 {
                                     oc_ui_label_str8(key);
 
-                                    oc_ui_container("cells", 0)
+                                    oc_ui_box* box = oc_ui_container("cells", OC_UI_FLAG_DRAW_PROC)
                                     {
                                         if(card->root)
                                         {
@@ -698,6 +1375,11 @@ int main()
                                             cell_update_rects(card->root, (oc_vec2){ 0 });
                                             build_cell_ui(scratch.arena, &editor, card->root);
                                         }
+                                    }
+
+                                    if(editor.editedCard == card)
+                                    {
+                                        oc_ui_box_set_draw_proc(box, bb_editor_draw_proc, &editor);
                                     }
                                 }
                             }
