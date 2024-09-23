@@ -56,8 +56,12 @@ enum
 typedef enum
 {
     BB_CELL_HOLE,
-    BB_CELL_LIST,
     BB_CELL_SYMBOL,
+    BB_CELL_CHAR,
+    BB_CELL_STRING,
+
+    BB_CELL_COMMENT,
+    BB_CELL_LIST,
 
 } bb_cell_kind;
 
@@ -109,6 +113,9 @@ typedef struct bb_point
 
 typedef struct bb_cell_editor
 {
+    oc_arena arena;
+    u64 nextCellId;
+
     f32 spaceWidth;
     f32 lineHeight;
 
@@ -121,6 +128,30 @@ typedef struct bb_cell_editor
     bb_point mark;
 
 } bb_cell_editor;
+
+void bb_cell_push(bb_cell* parent, bb_cell* cell)
+{
+    OC_DEBUG_ASSERT(cell != parent);
+    cell->parent = parent;
+    oc_list_push_back(&parent->children, &cell->parentElt);
+    cell->parent->childCount++;
+}
+
+void bb_cell_insert(bb_cell* afterSibling, bb_cell* cell)
+{
+    OC_DEBUG_ASSERT(cell != afterSibling->parent);
+    cell->parent = afterSibling->parent;
+    oc_list_insert(&cell->parent->children, &afterSibling->parentElt, &cell->parentElt);
+    cell->parent->childCount++;
+}
+
+void bb_cell_insert_before(bb_cell* beforeSibling, bb_cell* cell)
+{
+    OC_DEBUG_ASSERT(cell != beforeSibling->parent);
+    cell->parent = beforeSibling->parent;
+    oc_list_insert_before(&cell->parent->children, &beforeSibling->parentElt, &cell->parentElt);
+    cell->parent->childCount++;
+}
 
 //------------------------------------------------------------------------------------------
 // bb_point helpers
@@ -291,6 +322,124 @@ oc_vec2 bb_point_to_display_pos(bb_cell_editor* editor, bb_point point)
         cursorPos.y = box.y;
     }
     return (cursorPos);
+}
+
+//------------------------------------------------------------------------------------------
+// cell insert/remove
+//------------------------------------------------------------------------------------------
+
+void bb_insert_at_cursor(bb_cell_editor* editor, bb_cell* cell)
+{
+    oc_vec2 start = bb_point_to_display_pos(editor, editor->cursor);
+    cell->rect.x = start.x;
+    cell->rect.y = start.y;
+
+    bb_cell* cursorParent = editor->cursor.parent;
+
+    if(bb_cell_has_children(cursorParent))
+    {
+        if(editor->cursor.leftFrom)
+        {
+            bb_cell_insert_before(editor->cursor.leftFrom, cell);
+        }
+        else
+        {
+            bb_cell_push(cursorParent, cell);
+        }
+    }
+    else if(bb_cell_has_text(cursorParent))
+    {
+        if(cursorParent->kind == BB_CELL_HOLE)
+        {
+            bb_cell_insert(cursorParent, cell);
+            // bb_cell_recycle(editor, cursorParent);
+        }
+        else if(editor->cursor.offset == 0)
+        {
+            bb_cell_insert_before(cursorParent, cell);
+        }
+        else
+        {
+            bb_cell_insert(cursorParent, cell);
+        }
+    }
+    else
+    {
+        bb_cell_insert(cursorParent, cell);
+    }
+
+    editor->cursor = (bb_point){ cell, 0, 0 };
+    editor->mark = editor->cursor;
+
+    //    bb_mark_modified(editor, cell->parent);
+}
+
+void bb_insert_cell(bb_cell_editor* editor, bb_cell_kind kind)
+{
+    bb_cell* cell = oc_arena_push_type(&editor->arena, bb_cell);
+    memset(cell, 0, sizeof(bb_cell));
+    cell->id = editor->nextCellId++;
+    cell->kind = kind;
+
+    bb_insert_at_cursor(editor, cell);
+}
+
+void bb_insert_placeholder(bb_cell_editor* editor)
+{
+    bb_cell* nextCell = 0;
+    if(bb_cell_has_text(editor->cursor.parent))
+    {
+        nextCell = bb_cell_next_sibling(editor->cursor.parent);
+    }
+    else if(editor->cursor.leftFrom)
+    {
+        nextCell = editor->cursor.leftFrom;
+    }
+
+    if(nextCell && nextCell->kind == BB_CELL_HOLE)
+    {
+        editor->cursor = (bb_point){ .parent = nextCell };
+        editor->mark = editor->cursor;
+    }
+    else
+    {
+        bb_insert_cell(editor, BB_CELL_HOLE);
+    }
+}
+
+//------------------------------------------------------------------------------------
+// Text edition
+//------------------------------------------------------------------------------------
+
+void bb_replace_text_selection_with_utf8(bb_cell_editor* editor, u64 count, char* input)
+{
+    bb_cell* cell = editor->cursor.parent;
+
+    u32 selStart = oc_min(editor->cursor.offset, editor->mark.offset);
+    u32 selEnd = oc_max(editor->cursor.offset, editor->mark.offset);
+
+    if(cell->kind == BB_CELL_HOLE)
+    {
+        selStart = 0;
+        selEnd = cell->text.len;
+    }
+
+    u64 newLen = cell->text.len + count - (selEnd - selStart);
+
+    oc_arena_scope scratch = oc_scratch_begin();
+
+    oc_str8_list insertList = {};
+    oc_str8_list_push(scratch.arena, &insertList, oc_str8_slice(cell->text, 0, selStart));
+    oc_str8_list_push(scratch.arena, &insertList, oc_str8_from_buffer(count, input));
+    oc_str8_list_push(scratch.arena, &insertList, oc_str8_slice(cell->text, selEnd, cell->text.len));
+
+    cell->text = oc_str8_list_join(&editor->arena, insertList);
+    editor->cursor.offset = selStart + count;
+
+    editor->mark = editor->cursor;
+    //	bb_relex_cell(editor, cell, string);
+
+    oc_scratch_end(scratch);
 }
 
 //------------------------------------------------------------------------------------------
@@ -862,14 +1011,14 @@ void bb_draw_edit_range(bb_cell_editor* editor)
         /*
         //NOTE(martin): multiple nodes are selected, highlight the selection (in blue)
         bb_cell_span span = bb_cell_span_from_points(cursor, mark);
-        q_cell* parent = span.start->parent;
-        q_cell* stop = cell_next_sibling(span.end);
+        bb_cell* parent = span.start->parent;
+        bb_cell* stop = cell_next_sibling(span.end);
 
         mp_aligned_rect startBox = bb_cell_frame_box(span.start);
         mp_aligned_rect box = startBox;
         mp_aligned_rect endBox = startBox;
 
-        for(q_cell* cell = span.start; cell != stop; cell = cell_next_sibling(cell))
+        for(bb_cell* cell = span.start; cell != stop; cell = cell_next_sibling(cell))
         {
             endBox = bb_cell_frame_box(cell);
             box = bb_combined_box(box, endBox);
@@ -926,7 +1075,7 @@ void bb_draw_edit_range(bb_cell_editor* editor)
             oc_set_color_rgba(0.2, 0.2, 1, 1);
             oc_rectangle_fill(selBox.x, selBox.y, selBox.w, selBox.h);
 
-            //  editor->animatedCursor = bb_point_to_display_pos(editor, tab->cursor);
+            //  editor->animatedCursor = bb_point_to_display_pos(editor, editor->cursor);
         }
         else
         {
@@ -1136,7 +1285,11 @@ int main()
             .leftFrom = 0,
             .offset = 3,
         },
+
+        .nextCellId = 100,
     };
+
+    oc_arena_init(&editor.arena);
 
     while(!oc_should_quit())
     {
@@ -1179,6 +1332,62 @@ int main()
                 bb_run_command(&editor, command);
                 runCommand = true;
                 break;
+            }
+        }
+
+        if(!runCommand)
+        {
+            //NOTE(martin): handle character input
+            oc_str32 textInput = oc_input_text_utf32(scratch.arena, &ui.input);
+
+            for(int textIndex = 0; textIndex < textInput.len; textIndex++)
+            {
+                oc_utf32 codePoint = textInput.ptr[textIndex];
+
+                //NOTE: character-based commands
+                if(editor.cursor.parent->kind != BB_CELL_STRING
+                   && editor.cursor.parent->kind != BB_CELL_CHAR
+                   && editor.cursor.parent->kind != BB_CELL_COMMENT)
+                {
+                    bool found = false;
+                    for(int i = 0; i < BB_COMMAND_COUNT; i++)
+                    {
+                        const bb_command* command = &(BB_COMMANDS[i]);
+
+                        if(command->codePoint == codePoint)
+                        {
+                            bb_run_command(&editor, command);
+                            found = true;
+                            break;
+                        }
+                    }
+                    if(found)
+                    {
+                        continue;
+                    }
+                }
+
+                //TODO: allow replacing cell span with text
+
+                //NOTE: text insertion
+                if(!bb_cell_has_text(editor.cursor.parent))
+                {
+                    bb_insert_placeholder(&editor);
+                }
+
+                if(editor.cursor.parent == editor.mark.parent)
+                {
+                    char backing[4];
+                    oc_str8 utf8Input = oc_utf8_encode(backing, codePoint);
+                    bb_replace_text_selection_with_utf8(&editor, utf8Input.len, utf8Input.ptr);
+                }
+
+                // bb_rebuild(editor);
+            }
+
+            if(textInput.len)
+            {
+                //  bb_reset_cursor_blink(editor);
             }
         }
 
