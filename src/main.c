@@ -1938,6 +1938,10 @@ void bb_card_draw_cells(oc_arena* frameArena, bb_cell_editor* editor, bb_card* c
     {
         oc_ui_box_set_draw_proc(box, bb_editor_draw_proc, editor);
     }
+    else
+    {
+        oc_ui_box_set_draw_proc(box, 0, editor);
+    }
 }
 
 int main()
@@ -2059,6 +2063,14 @@ int main()
     };
 
     oc_arena_init(&editor.arena);
+
+    for(int i = 0; i < 8; i++)
+    {
+        cards[i].root = oc_arena_push_type(&editor.arena, bb_cell);
+        memset(cards[i].root, 0, sizeof(bb_cell));
+        cards[i].root->id = 0;
+        cards[i].root->kind = BB_CELL_LIST;
+    }
 
     bb_cell* root = oc_arena_push_type(&editor.arena, bb_cell);
     memset(root, 0, sizeof(bb_cell));
@@ -2284,6 +2296,8 @@ int main()
                                  },
                                  OC_UI_STYLE_FLOAT | OC_UI_STYLE_SIZE);
 
+                bool selectedEdit = false;
+
                 oc_ui_box* canvas = oc_ui_container("center-panel", OC_UI_FLAG_DRAW_BORDER | OC_UI_FLAG_CLICKABLE)
                 {
                     oc_ui_sig canvasSig = oc_ui_box_sig(canvas);
@@ -2293,7 +2307,7 @@ int main()
                         canvas->scroll.y -= canvasSig.delta.y;
                     }
 
-                    oc_ui_container("contents", 0)
+                    oc_ui_container("contents", OC_UI_FLAG_CLICKABLE)
                     {
                         oc_list_for(middleList, card, bb_card, listElt)
                         {
@@ -2311,7 +2325,6 @@ int main()
 
                             static resize_side resizing = 0;
                             bool thumbnailed = false;
-
                             if(box)
                             {
                                 oc_ui_sig sig = oc_ui_box_sig(box);
@@ -2342,6 +2355,17 @@ int main()
                                         dragging->rect.y = mousePos.y - sig.mouse.y;
                                     }
                                 }
+                                if(sig.rightPressed)
+                                {
+                                    selectedEdit = true;
+                                    editor.editedCard = card;
+                                    editor.cursor = (bb_point){
+                                        .parent = card->root,
+                                        .leftFrom = oc_list_first_entry(card->root->children, bb_cell, parentElt),
+                                    };
+                                    editor.mark = editor.cursor;
+                                }
+
                                 if(sig.released)
                                 {
                                     resizing = 0;
@@ -2394,8 +2418,12 @@ int main()
                                                      .borderColor = OC_UI_DARK_THEME.bg1,
                                                      .borderSize = 2,
                                                      .roundness = 5,
+                                                     .layout.margin = {
+                                                         .x = 10,
+                                                         .y = 10,
+                                                     },
                                                  },
-                                                 OC_UI_STYLE_SIZE | OC_UI_STYLE_FLOAT | OC_UI_STYLE_BG_COLOR | OC_UI_STYLE_BORDER_COLOR | OC_UI_STYLE_BORDER_SIZE | OC_UI_STYLE_ROUNDNESS);
+                                                 OC_UI_STYLE_SIZE | OC_UI_STYLE_FLOAT | OC_UI_STYLE_BG_COLOR | OC_UI_STYLE_BORDER_COLOR | OC_UI_STYLE_BORDER_SIZE | OC_UI_STYLE_ROUNDNESS | OC_UI_STYLE_LAYOUT_MARGINS);
 
                                 oc_ui_container_str8(key,
                                                      OC_UI_FLAG_CLIP
@@ -2410,6 +2438,10 @@ int main()
                             }
                         }
                     }
+                }
+                if(oc_ui_box_sig(canvas).rightPressed && !selectedEdit)
+                {
+                    editor.editedCard = 0;
                 }
 
                 //-------------------------------------------------------------------------------------
@@ -2495,8 +2527,12 @@ int main()
                                                      .borderColor = OC_UI_DARK_THEME.bg1,
                                                      .borderSize = 2,
                                                      .roundness = 5,
+                                                     .layout.margin = {
+                                                         .x = 10,
+                                                         .y = 10,
+                                                     },
                                                  },
-                                                 OC_UI_STYLE_SIZE | OC_UI_STYLE_FLOAT | OC_UI_STYLE_BG_COLOR | OC_UI_STYLE_BORDER_COLOR | OC_UI_STYLE_BORDER_SIZE | OC_UI_STYLE_ROUNDNESS);
+                                                 OC_UI_STYLE_SIZE | OC_UI_STYLE_FLOAT | OC_UI_STYLE_BG_COLOR | OC_UI_STYLE_BORDER_COLOR | OC_UI_STYLE_BORDER_SIZE | OC_UI_STYLE_ROUNDNESS | OC_UI_STYLE_LAYOUT_MARGINS);
 
                                 oc_ui_box* box = oc_ui_container_str8(key, OC_UI_FLAG_CLIP | OC_UI_FLAG_DRAW_BACKGROUND | OC_UI_FLAG_CLICKABLE)
                                 {
@@ -2565,8 +2601,12 @@ int main()
                                          .borderColor = OC_UI_DARK_THEME.bg1,
                                          .borderSize = 2,
                                          .roundness = 5,
+                                         .layout.margin = {
+                                             .x = 10,
+                                             .y = 10,
+                                         },
                                      },
-                                     OC_UI_STYLE_SIZE | OC_UI_STYLE_FLOAT | OC_UI_STYLE_BG_COLOR | OC_UI_STYLE_BORDER_COLOR | OC_UI_STYLE_BORDER_SIZE | OC_UI_STYLE_ROUNDNESS);
+                                     OC_UI_STYLE_SIZE | OC_UI_STYLE_FLOAT | OC_UI_STYLE_BG_COLOR | OC_UI_STYLE_BORDER_COLOR | OC_UI_STYLE_BORDER_SIZE | OC_UI_STYLE_ROUNDNESS | OC_UI_STYLE_LAYOUT_MARGINS);
 
                     oc_str8 key = oc_str8_pushf(scratch.arena, "card-%u", dragging->id);
 
