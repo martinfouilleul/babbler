@@ -1922,6 +1922,24 @@ void bb_editor_draw_proc(oc_ui_box* box, void* data)
     oc_matrix_pop();
 }
 
+void bb_card_draw_cells(oc_arena* frameArena, bb_cell_editor* editor, bb_card* card)
+{
+    oc_ui_box* box = oc_ui_container("cells", OC_UI_FLAG_DRAW_PROC)
+    {
+        if(card->root)
+        {
+            cell_update_layout(editor, card->root, (oc_vec2){ 10, 20 });
+            cell_update_rects(editor, card->root, (oc_vec2){ 0 });
+            build_cell_ui(frameArena, editor, card->root);
+        }
+    }
+
+    if(editor->editedCard == card)
+    {
+        oc_ui_box_set_draw_proc(box, bb_editor_draw_proc, editor);
+    }
+}
+
 int main()
 {
     oc_init();
@@ -2380,27 +2398,14 @@ int main()
                                                  OC_UI_STYLE_SIZE | OC_UI_STYLE_FLOAT | OC_UI_STYLE_BG_COLOR | OC_UI_STYLE_BORDER_COLOR | OC_UI_STYLE_BORDER_SIZE | OC_UI_STYLE_ROUNDNESS);
 
                                 oc_ui_container_str8(key,
-                                                     OC_UI_FLAG_DRAW_BACKGROUND
+                                                     OC_UI_FLAG_CLIP
+                                                         | OC_UI_FLAG_DRAW_BACKGROUND
                                                          | OC_UI_FLAG_DRAW_BORDER
                                                          | OC_UI_FLAG_CLICKABLE
                                                          | OC_UI_FLAG_BLOCK_MOUSE)
                                 {
                                     oc_ui_label_str8(key);
-
-                                    oc_ui_box* box = oc_ui_container("cells", OC_UI_FLAG_DRAW_PROC)
-                                    {
-                                        if(card->root)
-                                        {
-                                            cell_update_layout(&editor, card->root, (oc_vec2){ 10, 20 });
-                                            cell_update_rects(&editor, card->root, (oc_vec2){ 0 });
-                                            build_cell_ui(scratch.arena, &editor, card->root);
-                                        }
-                                    }
-
-                                    if(editor.editedCard == card)
-                                    {
-                                        oc_ui_box_set_draw_proc(box, bb_editor_draw_proc, &editor);
-                                    }
+                                    bb_card_draw_cells(scratch.arena, &editor, card);
                                 }
                             }
                         }
@@ -2493,9 +2498,10 @@ int main()
                                                  },
                                                  OC_UI_STYLE_SIZE | OC_UI_STYLE_FLOAT | OC_UI_STYLE_BG_COLOR | OC_UI_STYLE_BORDER_COLOR | OC_UI_STYLE_BORDER_SIZE | OC_UI_STYLE_ROUNDNESS);
 
-                                oc_ui_box* box = oc_ui_container_str8(key, OC_UI_FLAG_DRAW_BACKGROUND | OC_UI_FLAG_CLICKABLE)
+                                oc_ui_box* box = oc_ui_container_str8(key, OC_UI_FLAG_CLIP | OC_UI_FLAG_DRAW_BACKGROUND | OC_UI_FLAG_CLICKABLE)
                                 {
                                     oc_ui_label_str8(key);
+                                    bb_card_draw_cells(scratch.arena, &editor, card);
                                 }
 
                                 oc_ui_sig sig = oc_ui_box_sig(box);
@@ -2565,13 +2571,15 @@ int main()
                     oc_str8 key = oc_str8_pushf(scratch.arena, "card-%u", dragging->id);
 
                     oc_ui_container_str8(key,
-                                         OC_UI_FLAG_DRAW_BACKGROUND
+                                         OC_UI_FLAG_CLIP
+                                             | OC_UI_FLAG_DRAW_BACKGROUND
                                              | OC_UI_FLAG_DRAW_BORDER
                                              | OC_UI_FLAG_CLICKABLE
                                              | OC_UI_FLAG_BLOCK_MOUSE
                                              | (dragging ? OC_UI_FLAG_OVERLAY : 0))
                     {
                         oc_ui_label_str8(key);
+                        bb_card_draw_cells(scratch.arena, &editor, dragging);
                     }
                 }
 
