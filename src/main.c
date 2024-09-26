@@ -46,8 +46,8 @@ struct bb_cell
     u64 id;
     bb_cell_kind kind;
     oc_str8 text;
-    u64 valueU64;
-    f64 valueF64;
+    u64 valU64;
+    f64 valF64;
 
     oc_rect rect;
     f32 lastLineWidth;
@@ -178,7 +178,7 @@ bool bb_point_equal(bb_point a, bb_point b)
 
 bb_cell* bb_point_left_cell(bb_point point)
 {
-    return (point.leftFrom ? oc_list_prev_entry(point.parent->children, point.leftFrom, bb_cell, parentElt)
+    return (point.leftFrom ? oc_list_prev_entry(point.leftFrom, bb_cell, parentElt)
                            : oc_list_last_entry(point.parent->children, bb_cell, parentElt));
 }
 
@@ -234,8 +234,8 @@ bb_point bb_prev_point(bb_point point)
 
 #define bb_cell_first_child(parent) oc_list_first_entry(((parent)->children), bb_cell, parentElt)
 #define bb_cell_last_child(parent) oc_list_last_entry(((parent)->children), bb_cell, parentElt)
-#define bb_cell_next_sibling(cell) oc_list_next_entry(((cell)->parent->children), (cell), bb_cell, parentElt)
-#define bb_cell_prev_sibling(cell) oc_list_prev_entry(((cell)->parent->children), (cell), bb_cell, parentElt)
+#define bb_cell_next_sibling(cell) oc_list_next_entry((cell), bb_cell, parentElt)
+#define bb_cell_prev_sibling(cell) oc_list_prev_entry((cell), bb_cell, parentElt)
 
 bb_point bb_next_point(bb_point point)
 {
@@ -694,8 +694,8 @@ const u32 BB_LEX_KEYWORD_COUNT = sizeof(BB_LEX_KEYWORDS) / sizeof(bb_lex_entry);
 typedef struct bb_lex_result
 {
     bb_cell_kind kind;
-    u64 valueU64;
-    f64 valueF64;
+    u64 valU64;
+    f64 valF64;
     oc_str8 string;
 } bb_lex_result;
 
@@ -725,7 +725,7 @@ bb_lex_result bb_lex_operator(oc_str8 string, u64 byteOffset)
     {
         if(!oc_str8_cmp(result.string, BB_LEX_OPERATORS[i].string))
         {
-            result.valueU64 = BB_LEX_OPERATORS[i].token;
+            result.valU64 = BB_LEX_OPERATORS[i].token;
             break;
         }
     }
@@ -769,7 +769,7 @@ bb_lex_result bb_lex_identifier_or_keyword(oc_str8 string, u64 byteOffset)
         if(!oc_str8_cmp(result.string, BB_LEX_KEYWORDS[i].string))
         {
             result.kind = BB_CELL_KEYWORD;
-            result.valueU64 = BB_LEX_KEYWORDS[i].token;
+            result.valU64 = BB_LEX_KEYWORDS[i].token;
             break;
         }
     }
@@ -828,13 +828,13 @@ bb_lex_result bb_lex_number(oc_str8 string, u64 byteOffset)
         }
         result.kind = BB_CELL_FLOAT;
         result.string = oc_str8_slice(string, startOffset, endOffset);
-        result.valueF64 = (f64)numberU64 + (f64)decimals / pow(10, decimalCount);
+        result.valF64 = (f64)numberU64 + (f64)decimals / pow(10, decimalCount);
     }
     else
     {
         result.kind = BB_CELL_INT;
         result.string = oc_str8_slice(string, startOffset, endOffset);
-        result.valueU64 = numberU64;
+        result.valU64 = numberU64;
     }
     return (result);
 }
@@ -876,7 +876,7 @@ bb_lex_result bb_lex_next(oc_str8 string, u64 byteOffset, bb_cell_kind srcKind)
     if(srcKind == BB_CELL_STRING
        || srcKind == BB_CELL_COMMENT)
     {
-        //TODO for quote, set valueU64?
+        //TODO for quote, set valU64?
         result.string = oc_str8_slice(string, byteOffset, string.len);
         result.kind = srcKind;
     }
@@ -933,8 +933,8 @@ void bb_relex_cell(bb_cell_editor* editor, bb_cell* cell, oc_str8 string)
 
         bb_cell_text_replace(editor, cell, lex.string);
         cell->kind = lex.kind;
-        cell->valueU64 = lex.valueU64;
-        cell->valueF64 = lex.valueF64;
+        cell->valU64 = lex.valU64;
+        cell->valF64 = lex.valF64;
 
         if(byteOffset < string.len)
         {
@@ -1389,7 +1389,7 @@ cell_layout_options cell_get_layout_options(bb_cell* cell)
             bb_cell* head = oc_list_first_entry(cell->children, bb_cell, parentElt);
             if(head->kind == BB_CELL_KEYWORD)
             {
-                switch(head->valueU64)
+                switch(head->valU64)
                 {
                     case BB_TOKEN_KW_WHEN:
                         result = (cell_layout_options){
@@ -1930,10 +1930,34 @@ void bb_card_draw_cells(oc_arena* frameArena, bb_cell_editor* editor, bb_card* c
 // Rule system
 //------------------------------------------------------------------------------------------------
 
+typedef enum
+{
+    BB_VALUE_SYMBOL,
+    BB_VALUE_U64,
+    BB_VALUE_F64,
+    BB_VALUE_CARD_ID,
+
+    BB_VALUE_LIST,
+
+} bb_value_kind;
+
+typedef struct bb_value
+{
+    oc_list_elt parentElt;
+    oc_list children;
+
+    bb_value_kind kind;
+
+    oc_str8 string;
+    u64 valU64;
+    f64 valF64;
+
+} bb_value;
+
 typedef struct bb_fact
 {
     oc_list_elt listElt;
-    bb_cell* root;
+    bb_value* root;
 
 } bb_fact;
 
@@ -1943,29 +1967,126 @@ typedef struct bb_facts_db
 
 } bb_facts_db;
 
-void bb_program_interpret_cell(bb_facts_db* factDb, bb_cell* cell)
+bb_value* bb_program_eval_pattern(oc_arena* arena, bb_card* card, bb_cell* cell)
+{
+    bb_value* result = oc_arena_push_type(arena, bb_value);
+    memset(result, 0, sizeof(bb_value));
+
+    if(cell->kind == BB_CELL_LIST)
+    {
+        result->kind = BB_VALUE_LIST;
+        oc_list_for(cell->children, childCell, bb_cell, parentElt)
+        {
+            bb_value* childVal = bb_program_eval_pattern(arena, card, childCell);
+            oc_list_push_back(&result->children, &childVal->parentElt);
+        }
+    }
+    else if(cell->kind == BB_CELL_KEYWORD && cell->valU64 == BB_TOKEN_KW_SELF)
+    {
+        result->kind = BB_VALUE_CARD_ID;
+        result->valU64 = card->id;
+    }
+    else
+    {
+        result->kind = BB_VALUE_SYMBOL;
+        result->string = oc_str8_push_copy(arena, cell->text);
+    }
+
+    return (result);
+}
+
+void bb_program_interpret_cell(oc_arena* arena, bb_facts_db* factDb, bb_card* card, bb_cell* cell)
 {
     if(cell->kind == BB_CELL_LIST && !oc_list_empty(cell->children))
     {
         bb_cell* head = oc_list_first_entry(cell->children, bb_cell, parentElt);
 
-        if(head->kind == BB_TOKEN_KW_CLAIM)
+        if(head->kind == BB_CELL_KEYWORD && head->valU64 == BB_TOKEN_KW_CLAIM)
         {
+            bb_fact* fact = oc_arena_push_type(arena, bb_fact);
+            fact->root = oc_arena_push_type(arena, bb_value);
+            memset(fact->root, 0, sizeof(bb_value));
+            fact->root->kind = BB_VALUE_LIST;
+
+            for(bb_cell* cell = oc_list_next_entry(head, bb_cell, parentElt);
+                cell != 0;
+                cell = oc_list_next_entry(cell, bb_cell, parentElt))
+            {
+                bb_value* val = bb_program_eval_pattern(arena, card, cell);
+                oc_list_push_back(&fact->root->children, &val->parentElt);
+            }
+
+            oc_list_push_back(&factDb->facts, &fact->listElt);
         }
+    }
+}
+
+void bb_debug_print_value(bb_value* value)
+{
+    switch(value->kind)
+    {
+        case BB_VALUE_SYMBOL:
+            printf("%.*s", oc_str8_ip(value->string));
+            break;
+        case BB_VALUE_U64:
+            printf("%llu", value->valU64);
+            break;
+        case BB_VALUE_F64:
+            printf("%f", value->valF64);
+            break;
+        case BB_VALUE_CARD_ID:
+            printf("card-%llu", value->valU64);
+            break;
+
+        case BB_VALUE_LIST:
+        {
+            printf("(");
+            oc_list_for(value->children, child, bb_value, parentElt)
+            {
+                bb_debug_print_value(child);
+                if(child->parentElt.next)
+                {
+                    printf(" ");
+                }
+            }
+            printf(")");
+        }
+        break;
+    }
+}
+
+void bb_debug_print_facts(bb_facts_db* factDb)
+{
+    printf("Facts:\n");
+    i32 factIndex = 0;
+    oc_list_for(factDb->facts, fact, bb_fact, listElt)
+    {
+        printf("\tfact #%i:\n\t\t", factIndex);
+        bb_debug_print_value(fact->root);
+
+        printf("\n");
+        factIndex++;
     }
 }
 
 void bb_program_update(bb_facts_db* factDb, oc_list cards)
 {
+    factDb->facts = (oc_list){ 0 };
+
+    oc_arena_scope scratch = oc_scratch_begin();
     //TODO: loop until factDb has no new facts
 
     oc_list_for(cards, card, bb_card, listElt)
     {
         oc_list_for(card->root->children, cell, bb_cell, parentElt)
         {
-            bb_program_interpret_cell(factDb, cell);
+            bb_program_interpret_cell(scratch.arena, factDb, card, cell);
         }
     }
+
+    bb_debug_print_facts(factDb);
+
+    oc_scratch_end(scratch);
 }
 
 //------------------------------------------------------------------------------------------------
