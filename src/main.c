@@ -14,40 +14,6 @@
 
 #include "orca.h"
 
-oc_font create_font()
-{
-    //NOTE(martin): create font
-    oc_arena_scope scratch = oc_scratch_begin();
-    oc_str8 fontPath = oc_path_executable_relative(scratch.arena, OC_STR8("../resources/Menlo.ttf"));
-    char* fontPathCString = oc_str8_to_cstring(scratch.arena, fontPath);
-
-    FILE* fontFile = fopen(fontPathCString, "r");
-    if(!fontFile)
-    {
-        oc_log_error("Could not load font file '%s': %s\n", fontPathCString, strerror(errno));
-        oc_scratch_end(scratch);
-        return (oc_font_nil());
-    }
-    unsigned char* fontData = 0;
-    fseek(fontFile, 0, SEEK_END);
-    u32 fontDataSize = ftell(fontFile);
-    rewind(fontFile);
-    fontData = (unsigned char*)malloc(fontDataSize);
-    fread(fontData, 1, fontDataSize, fontFile);
-    fclose(fontFile);
-
-    oc_unicode_range ranges[5] = { OC_UNICODE_BASIC_LATIN,
-                                   OC_UNICODE_C1_CONTROLS_AND_LATIN_1_SUPPLEMENT,
-                                   OC_UNICODE_LATIN_EXTENDED_A,
-                                   OC_UNICODE_LATIN_EXTENDED_B,
-                                   OC_UNICODE_SPECIALS };
-
-    oc_font font = oc_font_create_from_memory(oc_str8_from_buffer(fontDataSize, (char*)fontData), 5, ranges);
-    free(fontData);
-    oc_scratch_end(scratch);
-    return (font);
-}
-
 enum
 {
     SIDE_PANEL_WIDTH = 150,
@@ -674,6 +640,16 @@ void bb_insert_list(bb_cell_editor* editor)
     bb_insert_cell(editor, BB_CELL_LIST);
 }
 
+void bb_insert_comment(bb_cell_editor* editor)
+{
+    bb_insert_cell(editor, BB_CELL_COMMENT);
+}
+
+void bb_insert_string_literal(bb_cell_editor* editor)
+{
+    bb_insert_cell(editor, BB_CELL_STRING);
+}
+
 //------------------------------------------------------------------------------------
 // Lexing
 //------------------------------------------------------------------------------------
@@ -687,7 +663,7 @@ void bb_insert_list(bb_cell_editor* editor)
 enum
 {
 
-#define X(tok, str) OC_CAT2(TOKEN_, tok),
+#define X(tok, str) OC_CAT2(BB_TOKEN_, tok),
     BB_TOKEN_KEYWORDS(X)
 #undef X
 };
@@ -709,7 +685,7 @@ const bb_lex_entry LEX_OPERATORS[] = {
 const u32 LEX_OPERATOR_COUNT = sizeof(LEX_OPERATORS) / sizeof(lex_entry);
 */
 const bb_lex_entry BB_LEX_KEYWORDS[] = {
-#define X(tok, str) { .token = OC_CAT2(TOKEN_, tok), .string = OC_STR8_LIT(str) },
+#define X(tok, str) { .token = OC_CAT2(BB_TOKEN_, tok), .string = OC_STR8_LIT(str) },
     BB_TOKEN_KEYWORDS(X)
 #undef X
 };
@@ -1191,16 +1167,16 @@ const bb_command BB_COMMANDS[] = {
         .move = bb_move_vertical,
         .direction = BB_NEXT,
     },
-    /*
-	//NOTE(martin): cells insertion
-	{
-		.key = OC_KEY_PERIOD,
-		.mods = OC_KEYMOD_CMD,
-		.action = bb_insert_comment,
-		.rebuild = true,
-		.focusCursor = true,
-	},
-	*/
+
+    //NOTE(martin): cells insertion
+    {
+        .key = 58,
+        .mods = OC_KEYMOD_CMD,
+        .action = bb_insert_comment,
+        .rebuild = true,
+        .focusCursor = true,
+    },
+
     {
         .codePoint = '(',
         .action = bb_insert_list,
@@ -1224,14 +1200,14 @@ const bb_command BB_COMMANDS[] = {
         .updateCompletion = true,
         .focusCursor = true,
     },
+    {
+        .codePoint = '\"',
+        .action = bb_insert_string_literal,
+        .rebuild = true,
+        .updateCompletion = true,
+        .focusCursor = true,
+    },
     /*
-	{
-		.codePoint = '\"',
-		.action = bb_insert_string_literal,
-		.rebuild = true,
-		.updateCompletion = true,
-		.focusCursor = true,
-	},
 	{
 		.codePoint = '\'',
 		.action = bb_insert_char_literal,
@@ -1415,7 +1391,7 @@ cell_layout_options cell_get_layout_options(bb_cell* cell)
             {
                 switch(head->valueU64)
                 {
-                    case TOKEN_KW_WHEN:
+                    case BB_TOKEN_KW_WHEN:
                         result = (cell_layout_options){
                             .vertical = true,
                             .inlineCount = 1,
@@ -1424,9 +1400,9 @@ cell_layout_options cell_get_layout_options(bb_cell* cell)
                             .indentedGroupSize = 1,
                         };
                         break;
-                    case TOKEN_KW_CLAIM:
+                    case BB_TOKEN_KW_CLAIM:
                         break;
-                    case TOKEN_KW_WISH:
+                    case BB_TOKEN_KW_WISH:
                         break;
                 }
             }
@@ -1468,11 +1444,11 @@ cell_layout_result cell_update_layout(bb_cell_editor* editor, bb_cell* cell, oc_
         oc_text_metrics metrics = oc_font_text_metrics(editor->font, editor->fontSize, text);
 
         result.rect.w = metrics.logical.w;
-        result.lastLineWidth = metrics.logical.w;
-        cell->lastLineWidth = metrics.logical.w;
-
         result.rect.w += bb_cell_left_decorator_width(editor, cell);
         result.rect.w += bb_cell_right_decorator_width(editor, cell);
+
+        result.lastLineWidth = result.rect.w;
+        cell->lastLineWidth = result.rect.w;
     }
     else if(bb_cell_has_children(cell))
     {
@@ -1714,7 +1690,27 @@ void bb_box_draw_proc(oc_ui_box* box, void* usr)
 
     oc_set_font(editor->font);
     oc_set_font_size(editor->fontSize);
-    oc_set_color_rgba(1, 1, 1, 1);
+
+    if(cell->kind == BB_CELL_FLOAT || cell->kind == BB_CELL_INT)
+    {
+        oc_set_color_srgba(0.556, 0.716, 0.864, 1);
+    }
+    else if(cell->kind == BB_CELL_KEYWORD)
+    {
+        oc_set_color_rgba(0.797, 0.398, 0.359, 1);
+    }
+    else if(cell->kind == BB_CELL_COMMENT)
+    {
+        oc_set_color_srgba(0.94, 0.59, 0.21, 1);
+    }
+    else if(cell->kind == BB_CELL_STRING)
+    {
+        oc_set_color_srgba(0, 0.9, 0, 1);
+    }
+    else
+    {
+        oc_set_color_rgba(1, 1, 1, 1);
+    }
 
     oc_vec2 pos = { box->rect.x, box->rect.y + editor->fontMetrics.ascent };
     if(leftSep.len)
@@ -1731,19 +1727,6 @@ void bb_box_draw_proc(oc_ui_box* box, void* usr)
         oc_set_font(editor->font);
         oc_set_font_size(editor->fontSize);
 
-        if(cell->kind == BB_CELL_FLOAT || cell->kind == BB_CELL_INT)
-        {
-            oc_set_color_rgba(0.556, 0.716, 0.864, 1);
-        }
-        else if(cell->kind == BB_CELL_KEYWORD)
-        {
-            oc_set_color_rgba(0.797, 0.398, 0.359, 1);
-        }
-        else
-        {
-            oc_set_color_rgba(1, 1, 1, 1);
-        }
-
         oc_move_to(pos.x, pos.y);
         oc_text_outlines(cell->text);
         oc_fill();
@@ -1753,7 +1736,6 @@ void bb_box_draw_proc(oc_ui_box* box, void* usr)
     {
         f32 w = oc_font_text_metrics(editor->font, editor->fontSize, rightSep).logical.w;
 
-        oc_set_color_rgba(1, 1, 1, 1);
         oc_move_to(box->rect.x + cell->lastLineWidth - w,
                    box->rect.y + box->rect.h - editor->lineHeight + editor->fontMetrics.ascent);
         oc_text_outlines(rightSep);
@@ -1944,12 +1926,92 @@ void bb_card_draw_cells(oc_arena* frameArena, bb_cell_editor* editor, bb_card* c
     }
 }
 
+//------------------------------------------------------------------------------------------------
+// Rule system
+//------------------------------------------------------------------------------------------------
+
+typedef struct bb_fact
+{
+    oc_list_elt listElt;
+    bb_cell* root;
+
+} bb_fact;
+
+typedef struct bb_facts_db
+{
+    oc_list facts;
+
+} bb_facts_db;
+
+void bb_program_interpret_cell(bb_facts_db* factDb, bb_cell* cell)
+{
+    if(cell->kind == BB_CELL_LIST && !oc_list_empty(cell->children))
+    {
+        bb_cell* head = oc_list_first_entry(cell->children, bb_cell, parentElt);
+
+        if(head->kind == BB_TOKEN_KW_CLAIM)
+        {
+        }
+    }
+}
+
+void bb_program_update(bb_facts_db* factDb, oc_list cards)
+{
+    //TODO: loop until factDb has no new facts
+
+    oc_list_for(cards, card, bb_card, listElt)
+    {
+        oc_list_for(card->root->children, cell, bb_cell, parentElt)
+        {
+            bb_program_interpret_cell(factDb, cell);
+        }
+    }
+}
+
+//------------------------------------------------------------------------------------------------
+// Main
+//------------------------------------------------------------------------------------------------
+
+oc_font create_font()
+{
+    //NOTE(martin): create font
+    oc_arena_scope scratch = oc_scratch_begin();
+    oc_str8 fontPath = oc_path_executable_relative(scratch.arena, OC_STR8("../resources/Menlo.ttf"));
+    char* fontPathCString = oc_str8_to_cstring(scratch.arena, fontPath);
+
+    FILE* fontFile = fopen(fontPathCString, "r");
+    if(!fontFile)
+    {
+        oc_log_error("Could not load font file '%s': %s\n", fontPathCString, strerror(errno));
+        oc_scratch_end(scratch);
+        return (oc_font_nil());
+    }
+    unsigned char* fontData = 0;
+    fseek(fontFile, 0, SEEK_END);
+    u32 fontDataSize = ftell(fontFile);
+    rewind(fontFile);
+    fontData = (unsigned char*)malloc(fontDataSize);
+    fread(fontData, 1, fontDataSize, fontFile);
+    fclose(fontFile);
+
+    oc_unicode_range ranges[5] = { OC_UNICODE_BASIC_LATIN,
+                                   OC_UNICODE_C1_CONTROLS_AND_LATIN_1_SUPPLEMENT,
+                                   OC_UNICODE_LATIN_EXTENDED_A,
+                                   OC_UNICODE_LATIN_EXTENDED_B,
+                                   OC_UNICODE_SPECIALS };
+
+    oc_font font = oc_font_create_from_memory(oc_str8_from_buffer(fontDataSize, (char*)fontData), 5, ranges);
+    free(fontData);
+    oc_scratch_end(scratch);
+    return (font);
+}
+
 int main()
 {
     oc_init();
 
     oc_rect windowRect = { .x = 100, .y = 100, .w = 1200, .h = 800 };
-    oc_window window = oc_window_create(windowRect, OC_STR8("test"), 0);
+    oc_window window = oc_window_create(windowRect, OC_STR8("Babbler"), 0);
 
     oc_rect contentRect = oc_window_get_content_rect(window);
 
@@ -1990,9 +2052,9 @@ int main()
     f32 dx = speed, dy = speed;
     f64 frameTime = 0;
 
-    oc_list leftList = { 0 };
-    oc_list rightList = { 0 };
-    oc_list middleList = { 0 };
+    oc_list InactiveList = { 0 };
+    oc_list backgroundList = { 0 };
+    oc_list activeList = { 0 };
 
     bb_card cards[8] = {
         {
@@ -2034,16 +2096,16 @@ int main()
         cards[i].displayRect = cards[i].rect;
     }
 
-    oc_list_push_back(&leftList, &cards[0].listElt);
-    oc_list_push_back(&leftList, &cards[1].listElt);
-    oc_list_push_back(&leftList, &cards[2].listElt);
+    oc_list_push_back(&InactiveList, &cards[0].listElt);
+    oc_list_push_back(&InactiveList, &cards[1].listElt);
+    oc_list_push_back(&InactiveList, &cards[2].listElt);
 
-    oc_list_push_back(&rightList, &cards[3].listElt);
-    oc_list_push_back(&rightList, &cards[4].listElt);
+    oc_list_push_back(&backgroundList, &cards[3].listElt);
+    oc_list_push_back(&backgroundList, &cards[4].listElt);
 
-    oc_list_push_back(&middleList, &cards[5].listElt);
-    oc_list_push_back(&middleList, &cards[6].listElt);
-    oc_list_push_back(&middleList, &cards[7].listElt);
+    oc_list_push_back(&activeList, &cards[5].listElt);
+    oc_list_push_back(&activeList, &cards[6].listElt);
+    oc_list_push_back(&activeList, &cards[7].listElt);
 
     f32 cardAnimationTimeConstant = 0.2;
 
@@ -2132,6 +2194,8 @@ int main()
     },
     editor.mark = editor.cursor;
 
+    bb_facts_db factDb = { 0 };
+
     while(!oc_should_quit())
     {
         oc_arena_scope scratch = oc_scratch_begin();
@@ -2160,78 +2224,84 @@ int main()
             }
         }
 
+        //NOTE(martin): update program
+        bb_program_update(&factDb, activeList);
+
         //NOTE(martin): handle keyboard shortcuts
-        bool runCommand = false;
-        oc_keymod_flags mods = oc_key_mods(&ui.input);
-        for(int i = 0; i < BB_COMMAND_COUNT; i++)
+        if(editor.editedCard)
         {
-            const bb_command* command = &(BB_COMMANDS[i]);
+            bool runCommand = false;
+            oc_keymod_flags mods = oc_key_mods(&ui.input) & (~OC_KEYMOD_MAIN_MODIFIER);
 
-            if((oc_key_press_count(&ui.input, command->key) || oc_key_repeat_count(&ui.input, command->key))
-               && command->mods == mods)
+            for(int i = 0; i < BB_COMMAND_COUNT; i++)
             {
-                bb_run_command(&editor, command);
-                runCommand = true;
-                break;
-            }
-        }
+                const bb_command* command = &(BB_COMMANDS[i]);
 
-        if(!runCommand)
-        {
-            //NOTE(martin): handle character input
-            oc_str32 textInput = oc_input_text_utf32(scratch.arena, &ui.input);
-
-            for(int textIndex = 0; textIndex < textInput.len; textIndex++)
-            {
-                oc_utf32 codePoint = textInput.ptr[textIndex];
-
-                //NOTE: character-based commands
-                if(editor.cursor.parent->kind != BB_CELL_STRING
-                   && editor.cursor.parent->kind != BB_CELL_CHAR
-                   && editor.cursor.parent->kind != BB_CELL_COMMENT)
+                if((oc_key_press_count(&ui.input, command->key) || oc_key_repeat_count(&ui.input, command->key))
+                   && command->mods == mods)
                 {
-                    bool found = false;
-                    for(int i = 0; i < BB_COMMAND_COUNT; i++)
-                    {
-                        const bb_command* command = &(BB_COMMANDS[i]);
+                    bb_run_command(&editor, command);
+                    runCommand = true;
+                    break;
+                }
+            }
 
-                        if(command->codePoint == codePoint)
+            if(!runCommand)
+            {
+                //NOTE(martin): handle character input
+                oc_str32 textInput = oc_input_text_utf32(scratch.arena, &ui.input);
+
+                for(int textIndex = 0; textIndex < textInput.len; textIndex++)
+                {
+                    oc_utf32 codePoint = textInput.ptr[textIndex];
+
+                    //NOTE: character-based commands
+                    if(editor.cursor.parent->kind != BB_CELL_STRING
+                       && editor.cursor.parent->kind != BB_CELL_CHAR
+                       && editor.cursor.parent->kind != BB_CELL_COMMENT)
+                    {
+                        bool found = false;
+                        for(int i = 0; i < BB_COMMAND_COUNT; i++)
                         {
-                            bb_run_command(&editor, command);
-                            found = true;
-                            break;
+                            const bb_command* command = &(BB_COMMANDS[i]);
+
+                            if(command->codePoint == codePoint)
+                            {
+                                bb_run_command(&editor, command);
+                                found = true;
+                                break;
+                            }
+                        }
+                        if(found)
+                        {
+                            continue;
                         }
                     }
-                    if(found)
+
+                    //TODO: allow replacing cell span with text
+
+                    //NOTE: text insertion
+                    if(!bb_cell_has_text(editor.cursor.parent))
                     {
-                        continue;
+                        bb_insert_placeholder(&editor);
                     }
+
+                    if(editor.cursor.parent == editor.mark.parent)
+                    {
+                        char backing[4];
+                        oc_str8 utf8Input = oc_utf8_encode(backing, codePoint);
+                        bb_replace_text_selection_with_utf8(&editor, utf8Input.len, utf8Input.ptr);
+                    }
+
+                    // bb_rebuild(editor);
                 }
 
-                //TODO: allow replacing cell span with text
-
-                //NOTE: text insertion
-                if(!bb_cell_has_text(editor.cursor.parent))
+                if(textInput.len)
                 {
-                    bb_insert_placeholder(&editor);
+                    //  bb_reset_cursor_blink(editor);
                 }
-
-                if(editor.cursor.parent == editor.mark.parent)
-                {
-                    char backing[4];
-                    oc_str8 utf8Input = oc_utf8_encode(backing, codePoint);
-                    bb_replace_text_selection_with_utf8(&editor, utf8Input.len, utf8Input.ptr);
-                }
-
-                // bb_rebuild(editor);
-            }
-
-            if(textInput.len)
-            {
-                //  bb_reset_cursor_blink(editor);
             }
         }
-
         oc_vec2 frameSize = oc_surface_get_size(surface);
         oc_ui_style defaultStyle = { .font = font };
         oc_ui_style_mask defaultMask = OC_UI_STYLE_FONT;
@@ -2309,7 +2379,7 @@ int main()
 
                     oc_ui_container("contents", OC_UI_FLAG_CLICKABLE)
                     {
-                        oc_list_for(middleList, card, bb_card, listElt)
+                        oc_list_for(activeList, card, bb_card, listElt)
                         {
                             oc_str8 key = oc_str8_pushf(scratch.arena, "card-%u", card->id);
 
@@ -2501,7 +2571,7 @@ int main()
                             i32 index = 0;
                             f32 x = (SIDE_PANEL_WIDTH - thumbnailSize) / 2;
                             f32 y = margin;
-                            oc_list_for_safe(leftList, card, bb_card, listElt)
+                            oc_list_for_safe(InactiveList, card, bb_card, listElt)
                             {
                                 if(index == placeholderIndex)
                                 {
@@ -2547,8 +2617,8 @@ int main()
 
                                     card->rect.x = mousePos.x - sig.mouse.x;
                                     card->rect.y = mousePos.y - sig.mouse.y;
-                                    oc_list_remove(&leftList, &card->listElt);
-                                    oc_list_push_back(&middleList, &card->listElt);
+                                    oc_list_remove(&InactiveList, &card->listElt);
+                                    oc_list_push_back(&activeList, &card->listElt);
 
                                     dragging = card;
                                 }
@@ -2630,14 +2700,14 @@ int main()
                         dragging->rect.x += leftPanelScroll->scroll.x;
                         dragging->rect.y += leftPanelScroll->scroll.y;
 
-                        oc_list_remove(&middleList, &dragging->listElt);
+                        oc_list_remove(&activeList, &dragging->listElt);
                         if(!insertBefore)
                         {
-                            oc_list_push_back(&leftList, &dragging->listElt);
+                            oc_list_push_back(&InactiveList, &dragging->listElt);
                         }
                         else
                         {
-                            oc_list_insert_before(&leftList, insertBefore, &dragging->listElt);
+                            oc_list_insert_before(&InactiveList, insertBefore, &dragging->listElt);
                         }
                     }
                     else
