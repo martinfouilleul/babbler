@@ -1933,6 +1933,7 @@ void bb_card_draw_cells(oc_arena* frameArena, bb_cell_editor* editor, bb_card* c
 typedef enum
 {
     BB_VALUE_SYMBOL,
+    BB_VALUE_STRING,
     BB_VALUE_U64,
     BB_VALUE_F64,
     BB_VALUE_CARD_ID,
@@ -1967,60 +1968,6 @@ typedef struct bb_facts_db
 
 } bb_facts_db;
 
-bb_value* bb_program_eval_pattern(oc_arena* arena, bb_card* card, bb_cell* cell)
-{
-    bb_value* result = oc_arena_push_type(arena, bb_value);
-    memset(result, 0, sizeof(bb_value));
-
-    if(cell->kind == BB_CELL_LIST)
-    {
-        result->kind = BB_VALUE_LIST;
-        oc_list_for(cell->children, childCell, bb_cell, parentElt)
-        {
-            bb_value* childVal = bb_program_eval_pattern(arena, card, childCell);
-            oc_list_push_back(&result->children, &childVal->parentElt);
-        }
-    }
-    else if(cell->kind == BB_CELL_KEYWORD && cell->valU64 == BB_TOKEN_KW_SELF)
-    {
-        result->kind = BB_VALUE_CARD_ID;
-        result->valU64 = card->id;
-    }
-    else
-    {
-        result->kind = BB_VALUE_SYMBOL;
-        result->string = oc_str8_push_copy(arena, cell->text);
-    }
-
-    return (result);
-}
-
-void bb_program_interpret_cell(oc_arena* arena, bb_facts_db* factDb, bb_card* card, bb_cell* cell)
-{
-    if(cell->kind == BB_CELL_LIST && !oc_list_empty(cell->children))
-    {
-        bb_cell* head = oc_list_first_entry(cell->children, bb_cell, parentElt);
-
-        if(head->kind == BB_CELL_KEYWORD && head->valU64 == BB_TOKEN_KW_CLAIM)
-        {
-            bb_fact* fact = oc_arena_push_type(arena, bb_fact);
-            fact->root = oc_arena_push_type(arena, bb_value);
-            memset(fact->root, 0, sizeof(bb_value));
-            fact->root->kind = BB_VALUE_LIST;
-
-            for(bb_cell* cell = oc_list_next_entry(head, bb_cell, parentElt);
-                cell != 0;
-                cell = oc_list_next_entry(cell, bb_cell, parentElt))
-            {
-                bb_value* val = bb_program_eval_pattern(arena, card, cell);
-                oc_list_push_back(&fact->root->children, &val->parentElt);
-            }
-
-            oc_list_push_back(&factDb->facts, &fact->listElt);
-        }
-    }
-}
-
 void bb_debug_print_value(bb_value* value)
 {
     switch(value->kind)
@@ -2028,12 +1975,19 @@ void bb_debug_print_value(bb_value* value)
         case BB_VALUE_SYMBOL:
             printf("%.*s", oc_str8_ip(value->string));
             break;
+
+        case BB_VALUE_STRING:
+            printf("\"%.*s\"", oc_str8_ip(value->string));
+            break;
+
         case BB_VALUE_U64:
             printf("%llu", value->valU64);
             break;
+
         case BB_VALUE_F64:
             printf("%f", value->valF64);
             break;
+
         case BB_VALUE_CARD_ID:
             printf("card-%llu", value->valU64);
             break;
@@ -2066,6 +2020,163 @@ void bb_debug_print_facts(bb_facts_db* factDb)
 
         printf("\n");
         factIndex++;
+    }
+}
+
+bb_value* bb_program_eval_pattern(oc_arena* arena, bb_card* card, bb_cell* cell)
+{
+    bb_value* result = oc_arena_push_type(arena, bb_value);
+    memset(result, 0, sizeof(bb_value));
+
+    if(cell->kind == BB_CELL_LIST)
+    {
+        result->kind = BB_VALUE_LIST;
+        oc_list_for(cell->children, childCell, bb_cell, parentElt)
+        {
+            bb_value* childVal = bb_program_eval_pattern(arena, card, childCell);
+            oc_list_push_back(&result->children, &childVal->parentElt);
+        }
+    }
+    else if(cell->kind == BB_CELL_KEYWORD && cell->valU64 == BB_TOKEN_KW_SELF)
+    {
+        result->kind = BB_VALUE_CARD_ID;
+        result->valU64 = card->id;
+    }
+    else if(cell->kind == BB_CELL_FLOAT)
+    {
+        result->kind = BB_VALUE_F64;
+        result->valF64 = cell->valF64;
+    }
+    else if(cell->kind == BB_CELL_INT)
+    {
+        result->kind = BB_VALUE_U64;
+        result->valU64 = cell->valU64;
+    }
+    else if(cell->kind == BB_CELL_STRING)
+    {
+        result->kind = BB_VALUE_STRING;
+        result->string = oc_str8_push_copy(arena, cell->text);
+    }
+    else
+    {
+        result->kind = BB_VALUE_SYMBOL;
+        result->string = oc_str8_push_copy(arena, cell->text);
+    }
+
+    return (result);
+}
+
+bb_value* bb_program_match_pattern_against_value(bb_value* value, bb_value* pattern)
+{
+    bb_value* result = 0;
+
+    bool match = (value->kind == pattern->kind);
+
+    if(match)
+    {
+        switch(value->kind)
+        {
+            case BB_VALUE_SYMBOL:
+            case BB_VALUE_STRING:
+                match = !oc_str8_cmp(value->string, pattern->string);
+                break;
+
+            case BB_VALUE_U64:
+            case BB_VALUE_CARD_ID:
+                match = (value->valU64 == pattern->valU64);
+                break;
+
+            case BB_VALUE_F64:
+                match = (value->valF64 == pattern->valF64);
+                break;
+
+            case BB_VALUE_LIST:
+            {
+
+                for(bb_value *childA = oc_list_first_entry(value->children, bb_value, parentElt),
+                             *childB = oc_list_first_entry(pattern->children, bb_value, parentElt);
+                    childA != 0 && childB != 0;
+                    childA = oc_list_next_entry(childA, bb_value, parentElt),
+                             childB = oc_list_next_entry(childB, bb_value, parentElt))
+                {
+                    if(bb_program_match_pattern_against_value(childA, childB) == 0)
+                    {
+                        match = false;
+                        break;
+                    }
+                }
+            }
+            break;
+        }
+        if(match)
+        {
+            result = value;
+        }
+    }
+
+    return result;
+}
+
+bb_value* bb_program_match_pattern(bb_facts_db* factDb, bb_value* pattern)
+{
+    //TODO: pattern can match several facts
+
+    bb_value* result = 0;
+
+    oc_list_for(factDb->facts, fact, bb_fact, listElt)
+    {
+        bb_value* val = bb_program_match_pattern_against_value(fact->root, pattern);
+        if(val)
+        {
+            result = val;
+            break;
+        }
+    }
+    return result;
+}
+
+void bb_program_interpret_cell(oc_arena* arena, bb_facts_db* factDb, bb_card* card, bb_cell* cell)
+{
+    if(cell->kind == BB_CELL_LIST && !oc_list_empty(cell->children))
+    {
+        bb_cell* head = oc_list_first_entry(cell->children, bb_cell, parentElt);
+
+        if(head->kind == BB_CELL_KEYWORD)
+        {
+            if(head->valU64 == BB_TOKEN_KW_CLAIM)
+            {
+                bb_fact* fact = oc_arena_push_type(arena, bb_fact);
+                fact->root = oc_arena_push_type(arena, bb_value);
+                memset(fact->root, 0, sizeof(bb_value));
+                fact->root->kind = BB_VALUE_LIST;
+
+                for(bb_cell* cell = oc_list_next_entry(head, bb_cell, parentElt);
+                    cell != 0;
+                    cell = oc_list_next_entry(cell, bb_cell, parentElt))
+                {
+                    bb_value* val = bb_program_eval_pattern(arena, card, cell);
+                    oc_list_push_back(&fact->root->children, &val->parentElt);
+                }
+
+                oc_list_push_back(&factDb->facts, &fact->listElt);
+            }
+            else if(head->valU64 == BB_TOKEN_KW_WHEN)
+            {
+                bb_cell* patternCell = oc_list_next_entry(head, bb_cell, parentElt);
+                if(patternCell)
+                {
+                    bb_value* pattern = bb_program_eval_pattern(arena, card, patternCell);
+                    bb_value* fact = bb_program_match_pattern(factDb, pattern);
+                    if(fact)
+                    {
+                        //DEBUG
+                        printf("matched fact: ");
+                        bb_debug_print_value(fact);
+                        printf("\n");
+                    }
+                }
+            }
+        }
     }
 }
 
