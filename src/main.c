@@ -1940,6 +1940,8 @@ typedef enum
 
     BB_VALUE_LIST,
 
+    BB_VALUE_PLACEHOLDER,
+
 } bb_value_kind;
 
 typedef struct bb_value
@@ -1962,9 +1964,22 @@ typedef struct bb_fact
 
 } bb_fact;
 
+typedef struct bb_facts_db bb_facts_db;
+
+typedef void (*bb_responder_proc)(bb_value* match, oc_list bindings, bb_facts_db* factDb, oc_list cards);
+
+typedef struct bb_responder
+{
+    oc_list_elt listElt;
+    bb_value* pattern;
+    bb_responder_proc proc;
+
+} bb_responder;
+
 typedef struct bb_facts_db
 {
     oc_list facts;
+    oc_list responders;
 
 } bb_facts_db;
 
@@ -2004,6 +2019,12 @@ void bb_debug_print_value(bb_value* value)
                 }
             }
             printf(")");
+        }
+        break;
+
+        case BB_VALUE_PLACEHOLDER:
+        {
+            printf("$%.*s", oc_str8_ip(value->string));
         }
         break;
     }
@@ -2066,15 +2087,22 @@ bb_value* bb_program_eval_pattern(oc_arena* arena, bb_card* card, bb_cell* cell)
     return (result);
 }
 
-bb_value* bb_program_match_pattern_against_value(bb_value* value, bb_value* pattern)
+typedef struct bb_binding
+{
+    oc_list_elt listElt;
+    oc_str8 name;
+    bb_value* value;
+} bb_binding;
+
+bb_value* bb_program_match_pattern_against_value(oc_arena* arena, bb_value* value, bb_value* pattern, oc_list* bindings)
 {
     bb_value* result = 0;
 
-    bool match = (value->kind == pattern->kind);
+    bool match = (value->kind == pattern->kind || pattern->kind == BB_VALUE_PLACEHOLDER);
 
     if(match)
     {
-        switch(value->kind)
+        switch(pattern->kind)
         {
             case BB_VALUE_SYMBOL:
             case BB_VALUE_STRING:
@@ -2099,12 +2127,21 @@ bb_value* bb_program_match_pattern_against_value(bb_value* value, bb_value* patt
                     childA = oc_list_next_entry(childA, bb_value, parentElt),
                              childB = oc_list_next_entry(childB, bb_value, parentElt))
                 {
-                    if(bb_program_match_pattern_against_value(childA, childB) == 0)
+                    if(bb_program_match_pattern_against_value(arena, childA, childB, bindings) == 0)
                     {
                         match = false;
                         break;
                     }
                 }
+            }
+            break;
+
+            case BB_VALUE_PLACEHOLDER:
+            {
+                bb_binding* binding = oc_arena_push_type(arena, bb_binding);
+                binding->name = pattern->string;
+                binding->value = value;
+                oc_list_push_back(bindings, &binding->listElt);
             }
             break;
         }
@@ -2117,7 +2154,7 @@ bb_value* bb_program_match_pattern_against_value(bb_value* value, bb_value* patt
     return result;
 }
 
-bb_value* bb_program_match_pattern(bb_facts_db* factDb, bb_value* pattern)
+bb_value* bb_program_match_pattern(oc_arena* arena, bb_facts_db* factDb, bb_value* pattern, oc_list* bindings)
 {
     //TODO: pattern can match several facts
 
@@ -2125,10 +2162,12 @@ bb_value* bb_program_match_pattern(bb_facts_db* factDb, bb_value* pattern)
 
     oc_list_for(factDb->facts, fact, bb_fact, listElt)
     {
-        bb_value* val = bb_program_match_pattern_against_value(fact->root, pattern);
+        oc_list matchBindings = { 0 };
+        bb_value* val = bb_program_match_pattern_against_value(arena, fact->root, pattern, &matchBindings);
         if(val)
         {
             result = val;
+            *bindings = matchBindings;
             break;
         }
     }
@@ -2150,11 +2189,42 @@ void bb_program_interpret_cell(oc_arena* arena, bb_facts_db* factDb, bb_card* ca
                 memset(fact->root, 0, sizeof(bb_value));
                 fact->root->kind = BB_VALUE_LIST;
 
-                for(bb_cell* cell = oc_list_next_entry(head, bb_cell, parentElt);
-                    cell != 0;
-                    cell = oc_list_next_entry(cell, bb_cell, parentElt))
+                for(bb_cell* child = oc_list_next_entry(head, bb_cell, parentElt);
+                    child != 0;
+                    child = oc_list_next_entry(child, bb_cell, parentElt))
                 {
-                    bb_value* val = bb_program_eval_pattern(arena, card, cell);
+                    bb_value* val = bb_program_eval_pattern(arena, card, child);
+                    oc_list_push_back(&fact->root->children, &val->parentElt);
+                }
+
+                oc_list_push_back(&factDb->facts, &fact->listElt);
+            }
+            else if(head->valU64 == BB_TOKEN_KW_WISH)
+            {
+                //NOTE: equivalent to  (claim self wishes ...)
+
+                bb_fact* fact = oc_arena_push_type(arena, bb_fact);
+                fact->root = oc_arena_push_type(arena, bb_value);
+                memset(fact->root, 0, sizeof(bb_value));
+                fact->root->kind = BB_VALUE_LIST;
+
+                bb_value* self = oc_arena_push_type(arena, bb_value);
+                memset(self, 0, sizeof(bb_value));
+                self->kind = BB_VALUE_CARD_ID;
+                self->valU64 = card->id;
+                oc_list_push_back(&fact->root->children, &self->parentElt);
+
+                bb_value* wishes = oc_arena_push_type(arena, bb_value);
+                memset(wishes, 0, sizeof(bb_value));
+                wishes->kind = BB_VALUE_SYMBOL;
+                wishes->string = oc_str8_push_cstring(arena, "wishes");
+                oc_list_push_back(&fact->root->children, &wishes->parentElt);
+
+                for(bb_cell* child = oc_list_next_entry(head, bb_cell, parentElt);
+                    child != 0;
+                    child = oc_list_next_entry(child, bb_cell, parentElt))
+                {
+                    bb_value* val = bb_program_eval_pattern(arena, card, child);
                     oc_list_push_back(&fact->root->children, &val->parentElt);
                 }
 
@@ -2165,17 +2235,110 @@ void bb_program_interpret_cell(oc_arena* arena, bb_facts_db* factDb, bb_card* ca
                 bb_cell* patternCell = oc_list_next_entry(head, bb_cell, parentElt);
                 if(patternCell)
                 {
+                    oc_list bindings = { 0 };
+
                     bb_value* pattern = bb_program_eval_pattern(arena, card, patternCell);
-                    bb_value* fact = bb_program_match_pattern(factDb, pattern);
+                    bb_value* fact = bb_program_match_pattern(arena, factDb, pattern, &bindings);
+
                     if(fact)
                     {
                         //DEBUG
                         printf("matched fact: ");
                         bb_debug_print_value(fact);
                         printf("\n");
+
+                        for(bb_cell* child = oc_list_next_entry(patternCell, bb_cell, parentElt);
+                            child != 0;
+                            child = oc_list_next_entry(child, bb_cell, parentElt))
+                        {
+                            bb_program_interpret_cell(arena, factDb, card, child);
+                        }
                     }
                 }
             }
+        }
+    }
+}
+
+bb_value* bb_find_binding(oc_list bindings, oc_str8 name)
+{
+    bb_value* value = 0;
+    oc_list_for(bindings, binding, bb_binding, listElt)
+    {
+        if(!oc_str8_cmp(binding->name, name))
+        {
+            value = binding->value;
+            break;
+        }
+    }
+    return value;
+}
+
+void bb_builtin_responder_squeak(bb_value* match, oc_list bindings, bb_facts_db* factDb, oc_list cards)
+{
+    bb_value* p = bb_find_binding(bindings, OC_STR8("p"));
+    bb_value* s = bb_find_binding(bindings, OC_STR8("s"));
+
+    if(p && s && p->kind == BB_VALUE_CARD_ID && s->kind == BB_VALUE_STRING)
+    {
+        printf("card-%llu is labeled %.*s\n", p->valU64, oc_str8_ip(s->string));
+    }
+}
+
+void bb_program_init_builtin_responders(oc_arena* arena, bb_facts_db* factDb)
+{
+    {
+        bb_responder* responder = oc_arena_push_type(arena, bb_responder);
+
+        bb_value* pattern = oc_arena_push_type(arena, bb_value);
+        pattern->kind = BB_VALUE_LIST;
+
+        bb_value* p = oc_arena_push_type(arena, bb_value);
+        p->kind = BB_VALUE_PLACEHOLDER;
+        p->string = oc_str8_push_cstring(arena, "p");
+        oc_list_push_back(&pattern->children, &p->parentElt);
+
+        bb_value* wishes = oc_arena_push_type(arena, bb_value);
+        wishes->kind = BB_VALUE_SYMBOL;
+        wishes->string = oc_str8_push_cstring(arena, "wishes");
+        oc_list_push_back(&pattern->children, &wishes->parentElt);
+
+        bb_value* q = oc_arena_push_type(arena, bb_value);
+        q->kind = BB_VALUE_PLACEHOLDER;
+        q->string = oc_str8_push_cstring(arena, "q");
+        oc_list_push_back(&pattern->children, &q->parentElt);
+
+        bb_value* is = oc_arena_push_type(arena, bb_value);
+        is->kind = BB_VALUE_SYMBOL;
+        is->string = oc_str8_push_cstring(arena, "is");
+        oc_list_push_back(&pattern->children, &is->parentElt);
+
+        bb_value* labeled = oc_arena_push_type(arena, bb_value);
+        labeled->kind = BB_VALUE_SYMBOL;
+        labeled->string = oc_str8_push_cstring(arena, "labeled");
+        oc_list_push_back(&pattern->children, &labeled->parentElt);
+
+        bb_value* s = oc_arena_push_type(arena, bb_value);
+        s->kind = BB_VALUE_PLACEHOLDER;
+        s->string = oc_str8_push_cstring(arena, "s");
+        oc_list_push_back(&pattern->children, &s->parentElt);
+
+        responder->pattern = pattern;
+        responder->proc = bb_builtin_responder_squeak;
+
+        oc_list_push_back(&factDb->responders, &responder->listElt);
+    }
+}
+
+void bb_program_run_builtin_responders(oc_arena* arena, bb_facts_db* factDb, oc_list cards)
+{
+    oc_list_for(factDb->responders, responder, bb_responder, listElt)
+    {
+        oc_list bindings = { 0 };
+        bb_value* match = bb_program_match_pattern(arena, factDb, responder->pattern, &bindings);
+        if(match)
+        {
+            responder->proc(match, bindings, factDb, cards);
         }
     }
 }
@@ -2194,6 +2357,8 @@ void bb_program_update(bb_facts_db* factDb, oc_list cards)
             bb_program_interpret_cell(scratch.arena, factDb, card, cell);
         }
     }
+
+    bb_program_run_builtin_responders(scratch.arena, factDb, cards);
 
     bb_debug_print_facts(factDb);
 
@@ -2427,6 +2592,8 @@ int main()
     editor.mark = editor.cursor;
 
     bb_facts_db factDb = { 0 };
+
+    bb_program_init_builtin_responders(&editor.arena, &factDb);
 
     while(!oc_should_quit())
     {
