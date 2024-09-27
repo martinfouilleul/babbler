@@ -51,6 +51,8 @@ struct bb_cell
 
     oc_rect rect;
     f32 lastLineWidth;
+
+    u32 lastRegistered;
 };
 
 typedef struct bb_card
@@ -1978,10 +1980,25 @@ typedef struct bb_responder
 
 typedef struct bb_facts_db
 {
+    u32 factCount;
     oc_list facts;
+
     oc_list responders;
 
+    u32 frameCount;
 } bb_facts_db;
+
+void bb_fact_db_push(oc_arena* arena, bb_facts_db* factDb, oc_list children)
+{
+    bb_fact* fact = oc_arena_push_type(arena, bb_fact);
+    fact->root = oc_arena_push_type(arena, bb_value);
+    memset(fact->root, 0, sizeof(bb_value));
+    fact->root->kind = BB_VALUE_LIST;
+    fact->root->children = children;
+
+    oc_list_push_back(&factDb->facts, &fact->listElt);
+    factDb->factCount++;
+}
 
 void bb_debug_print_value(bb_value* value)
 {
@@ -2184,51 +2201,53 @@ void bb_program_interpret_cell(oc_arena* arena, bb_facts_db* factDb, bb_card* ca
         {
             if(head->valU64 == BB_TOKEN_KW_CLAIM)
             {
-                bb_fact* fact = oc_arena_push_type(arena, bb_fact);
-                fact->root = oc_arena_push_type(arena, bb_value);
-                memset(fact->root, 0, sizeof(bb_value));
-                fact->root->kind = BB_VALUE_LIST;
-
-                for(bb_cell* child = oc_list_next_entry(head, bb_cell, parentElt);
-                    child != 0;
-                    child = oc_list_next_entry(child, bb_cell, parentElt))
+                if(cell->lastRegistered != factDb->frameCount)
                 {
-                    bb_value* val = bb_program_eval_pattern(arena, card, child);
-                    oc_list_push_back(&fact->root->children, &val->parentElt);
-                }
+                    cell->lastRegistered = factDb->frameCount;
 
-                oc_list_push_back(&factDb->facts, &fact->listElt);
+                    oc_list list = { 0 };
+
+                    for(bb_cell* child = oc_list_next_entry(head, bb_cell, parentElt);
+                        child != 0;
+                        child = oc_list_next_entry(child, bb_cell, parentElt))
+                    {
+                        bb_value* val = bb_program_eval_pattern(arena, card, child);
+                        oc_list_push_back(&list, &val->parentElt);
+                    }
+                    bb_fact_db_push(arena, factDb, list);
+                }
             }
             else if(head->valU64 == BB_TOKEN_KW_WISH)
             {
-                //NOTE: equivalent to  (claim self wishes ...)
-
-                bb_fact* fact = oc_arena_push_type(arena, bb_fact);
-                fact->root = oc_arena_push_type(arena, bb_value);
-                memset(fact->root, 0, sizeof(bb_value));
-                fact->root->kind = BB_VALUE_LIST;
-
-                bb_value* self = oc_arena_push_type(arena, bb_value);
-                memset(self, 0, sizeof(bb_value));
-                self->kind = BB_VALUE_CARD_ID;
-                self->valU64 = card->id;
-                oc_list_push_back(&fact->root->children, &self->parentElt);
-
-                bb_value* wishes = oc_arena_push_type(arena, bb_value);
-                memset(wishes, 0, sizeof(bb_value));
-                wishes->kind = BB_VALUE_SYMBOL;
-                wishes->string = oc_str8_push_cstring(arena, "wishes");
-                oc_list_push_back(&fact->root->children, &wishes->parentElt);
-
-                for(bb_cell* child = oc_list_next_entry(head, bb_cell, parentElt);
-                    child != 0;
-                    child = oc_list_next_entry(child, bb_cell, parentElt))
+                if(cell->lastRegistered != factDb->frameCount)
                 {
-                    bb_value* val = bb_program_eval_pattern(arena, card, child);
-                    oc_list_push_back(&fact->root->children, &val->parentElt);
-                }
+                    cell->lastRegistered = factDb->frameCount;
 
-                oc_list_push_back(&factDb->facts, &fact->listElt);
+                    //NOTE: equivalent to  (claim self wishes ...)
+                    oc_list list = { 0 };
+
+                    bb_value* self = oc_arena_push_type(arena, bb_value);
+                    memset(self, 0, sizeof(bb_value));
+                    self->kind = BB_VALUE_CARD_ID;
+                    self->valU64 = card->id;
+                    oc_list_push_back(&list, &self->parentElt);
+
+                    bb_value* wishes = oc_arena_push_type(arena, bb_value);
+                    memset(wishes, 0, sizeof(bb_value));
+                    wishes->kind = BB_VALUE_SYMBOL;
+                    wishes->string = oc_str8_push_cstring(arena, "wishes");
+                    oc_list_push_back(&list, &wishes->parentElt);
+
+                    for(bb_cell* child = oc_list_next_entry(head, bb_cell, parentElt);
+                        child != 0;
+                        child = oc_list_next_entry(child, bb_cell, parentElt))
+                    {
+                        bb_value* val = bb_program_eval_pattern(arena, card, child);
+                        oc_list_push_back(&list, &val->parentElt);
+                    }
+
+                    bb_fact_db_push(arena, factDb, list);
+                }
             }
             else if(head->valU64 == BB_TOKEN_KW_WHEN)
             {
@@ -2242,16 +2261,21 @@ void bb_program_interpret_cell(oc_arena* arena, bb_facts_db* factDb, bb_card* ca
 
                     if(fact)
                     {
-                        //DEBUG
-                        printf("matched fact: ");
-                        bb_debug_print_value(fact);
-                        printf("\n");
-
-                        for(bb_cell* child = oc_list_next_entry(patternCell, bb_cell, parentElt);
-                            child != 0;
-                            child = oc_list_next_entry(child, bb_cell, parentElt))
+                        if(cell->lastRegistered != factDb->frameCount)
                         {
-                            bb_program_interpret_cell(arena, factDb, card, child);
+                            cell->lastRegistered = factDb->frameCount;
+
+                            //DEBUG
+                            printf("matched fact: ");
+                            bb_debug_print_value(fact);
+                            printf("\n");
+
+                            for(bb_cell* child = oc_list_next_entry(patternCell, bb_cell, parentElt);
+                                child != 0;
+                                child = oc_list_next_entry(child, bb_cell, parentElt))
+                            {
+                                bb_program_interpret_cell(arena, factDb, card, child);
+                            }
                         }
                     }
                 }
@@ -2346,23 +2370,32 @@ void bb_program_run_builtin_responders(oc_arena* arena, bb_facts_db* factDb, oc_
 void bb_program_update(bb_facts_db* factDb, oc_list cards)
 {
     factDb->facts = (oc_list){ 0 };
+    factDb->factCount = 0;
 
     oc_arena_scope scratch = oc_scratch_begin();
     //TODO: loop until factDb has no new facts
 
-    oc_list_for(cards, card, bb_card, listElt)
+    u32 prevFactCount = 0;
+    do
     {
-        oc_list_for(card->root->children, cell, bb_cell, parentElt)
+        prevFactCount = factDb->factCount;
+
+        oc_list_for(cards, card, bb_card, listElt)
         {
-            bb_program_interpret_cell(scratch.arena, factDb, card, cell);
+            oc_list_for(card->root->children, cell, bb_cell, parentElt)
+            {
+                bb_program_interpret_cell(scratch.arena, factDb, card, cell);
+            }
         }
     }
+    while(prevFactCount != factDb->factCount);
 
     bb_program_run_builtin_responders(scratch.arena, factDb, cards);
-
     bb_debug_print_facts(factDb);
 
     oc_scratch_end(scratch);
+
+    factDb->frameCount++;
 }
 
 //------------------------------------------------------------------------------------------------
