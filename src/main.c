@@ -2854,14 +2854,15 @@ typedef struct bb_card_draw_proc_data
 void bb_card_draw_proc(oc_ui_box* box, void* user)
 {
     bb_card_draw_proc_data* data = (bb_card_draw_proc_data*)user;
+    oc_rect rect = box->rect;
 
     const f32 fontSize = 42;
     if(data->card->labelFrame == data->frame - 1)
     {
         oc_font_metrics fontMetrics = oc_font_get_metrics(data->editor->font, fontSize);
         oc_text_metrics metrics = oc_font_text_metrics(data->editor->font, fontSize, data->card->label);
-        f32 x = data->card->rect.x + (data->card->rect.w - metrics.logical.w) / 2;
-        f32 y = data->card->rect.y + (data->card->rect.h - metrics.logical.h) / 2 + fontMetrics.ascent;
+        f32 x = rect.x + (rect.w - metrics.logical.w) / 2;
+        f32 y = rect.y + (rect.h - metrics.logical.h) / 2 + fontMetrics.ascent;
 
         oc_move_to(x, y);
         oc_set_font(data->editor->font);
@@ -2875,18 +2876,16 @@ void bb_card_draw_proc(oc_ui_box* box, void* user)
         oc_color color = data->card->highlight;
         color.a = 0.3;
         oc_set_color(color);
-        oc_rounded_rectangle_fill(data->card->rect.x - 10,
-                                  data->card->rect.y - 10,
-                                  data->card->rect.w + 20,
-                                  data->card->rect.h + 20,
+        oc_rounded_rectangle_fill(rect.x - 10,
+                                  rect.y - 10,
+                                  rect.w + 20,
+                                  rect.h + 20,
                                   5 + 10);
     }
     for(u32 i = 0; i < BB_WHISKER_DIRECTION_COUNT; i++)
     {
         if(data->card->whiskerFrame[i] == data->frame - 1)
         {
-            oc_rect rect = data->card->rect;
-
             oc_set_color_rgba(0, 1, 0, 1);
 
             if(data->card->whiskerBoldFrame[i] == data->frame - 1)
@@ -3067,67 +3066,6 @@ int main()
         cards[i].root->id = 0;
         cards[i].root->kind = BB_CELL_LIST;
     }
-    /*
-    bb_cell* root = oc_arena_push_type(&editor.arena, bb_cell);
-    memset(root, 0, sizeof(bb_cell));
-    root->id = 0;
-    root->kind = BB_CELL_LIST;
-
-    bb_cell* whenList = oc_arena_push_type(&editor.arena, bb_cell);
-    memset(whenList, 0, sizeof(bb_cell));
-    whenList->id = 1;
-    whenList->parent = root;
-    oc_list_push_back(&root->children, &whenList->parentElt);
-    root->childCount++;
-    whenList->kind = BB_CELL_LIST;
-
-    bb_cell* when = oc_arena_push_type(&editor.arena, bb_cell);
-    memset(when, 0, sizeof(bb_cell));
-    when->id = 2;
-    when->parent = whenList;
-    oc_list_push_back(&whenList->children, &when->parentElt);
-    whenList->childCount++;
-    when->kind = BB_CELL_SYMBOL;
-    when->text = OC_STR8("when");
-    bb_relex_cell(&editor, when, OC_STR8("when"));
-
-    bb_cell* claimList = oc_arena_push_type(&editor.arena, bb_cell);
-    memset(claimList, 0, sizeof(bb_cell));
-    claimList->id = 3;
-    claimList->parent = root;
-    oc_list_push_back(&root->children, &claimList->parentElt);
-    root->childCount++;
-    claimList->kind = BB_CELL_LIST;
-
-    bb_cell* claim = oc_arena_push_type(&editor.arena, bb_cell);
-    memset(claim, 0, sizeof(bb_cell));
-    claim->id = 4;
-    claim->parent = claimList;
-    oc_list_push_back(&claimList->children, &claim->parentElt);
-    claimList->childCount++;
-    claim->kind = BB_CELL_SYMBOL;
-    claim->text = OC_STR8("claim");
-    bb_relex_cell(&editor, claim, OC_STR8("claim"));
-
-    bb_cell* self = oc_arena_push_type(&editor.arena, bb_cell);
-    memset(self, 0, sizeof(bb_cell));
-    self->id = 5;
-    self->parent = claimList;
-    oc_list_push_back(&claimList->children, &self->parentElt);
-    claimList->childCount++;
-    self->kind = BB_CELL_SYMBOL;
-    self->text = OC_STR8("self");
-    bb_relex_cell(&editor, self, OC_STR8("self"));
-
-    cards[7].root = root;
-
-    editor.cursor = (bb_point){
-        .parent = self,
-        .leftFrom = 0,
-        .offset = 3,
-    },
-    editor.mark = editor.cursor;
-    */
 
     bb_facts_db factDb = { .frame = 2 };
 
@@ -3444,29 +3382,6 @@ int main()
                                     oc_ui_label_str8(key);
                                     bb_card_draw_cells(scratch.arena, &editor, card);
                                 }
-
-                                oc_ui_style_next(&(oc_ui_style){
-                                                     .size = {
-                                                         .width = { OC_UI_SIZE_PIXELS, card->displayRect.w },
-                                                         .height = { OC_UI_SIZE_PIXELS, card->displayRect.h },
-                                                     },
-                                                     .floating = {
-                                                         .x = true,
-                                                         .y = true,
-                                                     },
-                                                     .floatTarget = { card->displayRect.x, card->displayRect.y },
-                                                 },
-                                                 OC_UI_STYLE_SIZE | OC_UI_STYLE_FLOAT);
-
-                                oc_str8 illumKey = oc_str8_pushf(scratch.arena, "illum-%llu", card->id);
-                                oc_ui_box* box = oc_ui_box_make_str8(illumKey, OC_UI_FLAG_DRAW_PROC);
-
-                                bb_card_draw_proc_data* data = oc_arena_push_type(scratch.arena, bb_card_draw_proc_data);
-                                data->card = card;
-                                data->frame = factDb.frame;
-                                data->editor = &editor;
-
-                                oc_ui_box_set_draw_proc(box, bb_card_draw_proc, data);
                             }
                         }
                     }
@@ -3647,8 +3562,7 @@ int main()
                                              | OC_UI_FLAG_DRAW_BACKGROUND
                                              | OC_UI_FLAG_DRAW_BORDER
                                              | OC_UI_FLAG_CLICKABLE
-                                             | OC_UI_FLAG_BLOCK_MOUSE
-                                             | (dragging ? OC_UI_FLAG_OVERLAY : 0))
+                                             | OC_UI_FLAG_BLOCK_MOUSE)
                     {
                         oc_ui_label_str8(key);
                         bb_card_draw_cells(scratch.arena, &editor, dragging);
@@ -3679,6 +3593,50 @@ int main()
                     }
 
                     dragging = 0;
+                }
+
+                //NOTE: overlay illuminations
+                oc_list_for(activeList, card, bb_card, listElt)
+                {
+                    oc_vec2 mousePos = oc_mouse_position(&ui.input);
+
+                    bool thumbnailed = (mousePos.x < SIDE_PANEL_WIDTH)
+                                    || (mousePos.x > frameSize.x - SIDE_PANEL_WIDTH);
+
+                    if(card != dragging || !thumbnailed)
+                    {
+                        f32 x = card->displayRect.x;
+                        f32 y = card->displayRect.y;
+
+                        if(card != dragging)
+                        {
+                            x -= canvas->scroll.x;
+                            y -= canvas->scroll.y;
+                        }
+
+                        oc_ui_style_next(&(oc_ui_style){
+                                             .size = {
+                                                 .width = { OC_UI_SIZE_PIXELS, card->displayRect.w },
+                                                 .height = { OC_UI_SIZE_PIXELS, card->displayRect.h },
+                                             },
+                                             .floating = {
+                                                 .x = true,
+                                                 .y = true,
+                                             },
+                                             .floatTarget = { x, y },
+                                         },
+                                         OC_UI_STYLE_SIZE | OC_UI_STYLE_FLOAT);
+
+                        oc_str8 illumKey = oc_str8_pushf(scratch.arena, "illum-%llu", card->id);
+                        oc_ui_box* box = oc_ui_box_make_str8(illumKey, OC_UI_FLAG_DRAW_PROC);
+
+                        bb_card_draw_proc_data* data = oc_arena_push_type(scratch.arena, bb_card_draw_proc_data);
+                        data->card = card;
+                        data->frame = factDb.frame;
+                        data->editor = &editor;
+
+                        oc_ui_box_set_draw_proc(box, bb_card_draw_proc, data);
+                    }
                 }
             }
         }
