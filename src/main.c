@@ -2049,7 +2049,7 @@ typedef struct bb_facts_db
 
 } bb_facts_db;
 
-oc_list bb_program_match_pattern(oc_arena* arena, bb_facts_db* factDb, bb_value* pattern);
+oc_list bb_program_match_pattern_against_facts(oc_arena* arena, bb_facts_db* factDb, bb_value* pattern);
 
 void bb_fact_db_push(oc_arena* arena, bb_facts_db* factDb, oc_list children)
 {
@@ -2058,7 +2058,7 @@ void bb_fact_db_push(oc_arena* arena, bb_facts_db* factDb, oc_list children)
         .kind = BB_VALUE_LIST,
         .children = children,
     };
-    oc_list matches = bb_program_match_pattern(arena, factDb, &root);
+    oc_list matches = bb_program_match_pattern_against_facts(arena, factDb, &root);
 
     if(oc_list_empty(matches))
     {
@@ -2280,12 +2280,15 @@ typedef struct bb_match_result
     oc_list bindings;
 } bb_match_result;
 
-oc_list bb_program_match_pattern(oc_arena* arena, bb_facts_db* factDb, bb_value* pattern)
+oc_list bb_program_match_pattern_against_facts(oc_arena* arena, bb_facts_db* factDb, bb_value* pattern)
 {
-    //NOTE: returns a list of match results. Each contain the matched value, and associated bindings
+    //NOTE: match pattern only against the facts in the db, not the builtin responders. This breaks a
+    // recursion cycle where responders need to add facts to the db, which first tries to find if the facts
+    // already exists, which would re-run the responders, etc...
+    // Hence bb_fact_db_push() needs to match new facts only against the existing facts, not responders.
+
     oc_list results = { 0 };
 
-    //NOTE: now match againsts facts
     oc_list_for(factDb->facts, fact, bb_fact, listElt)
     {
         oc_list bindings = { 0 };
@@ -2299,6 +2302,13 @@ oc_list bb_program_match_pattern(oc_arena* arena, bb_facts_db* factDb, bb_value*
             oc_list_push_back(&results, &result->listElt);
         }
     }
+    return results;
+}
+
+oc_list bb_program_match_pattern(oc_arena* arena, bb_facts_db* factDb, bb_value* pattern)
+{
+    //NOTE: returns a list of match results. Each contain the matched value, and associated bindings
+    oc_list results = { 0 };
 
     //NOTE: run the pattern against responders
     /*
@@ -2308,7 +2318,6 @@ oc_list bb_program_match_pattern(oc_arena* arena, bb_facts_db* factDb, bb_value*
         and call the responder routine with this. It should check which pages self points up to, and return
         (self points up at card-id) with ($x = card-id)
     */
-
     oc_list_for(factDb->responders, responder, bb_responder, listElt)
     {
         oc_list responderBindings = { 0 };
@@ -2316,7 +2325,8 @@ oc_list bb_program_match_pattern(oc_arena* arena, bb_facts_db* factDb, bb_value*
         if(match)
         {
             oc_list answerBindings = { 0 };
-            bb_fact* fact = responder->proc(arena, factDb, match, responderBindings, &answerBindings);
+            responder->proc(arena, factDb, match, responderBindings, &answerBindings);
+            /*
             if(fact)
             {
                 bb_match_result* result = oc_arena_push_type(arena, bb_match_result);
@@ -2324,8 +2334,12 @@ oc_list bb_program_match_pattern(oc_arena* arena, bb_facts_db* factDb, bb_value*
                 result->bindings = answerBindings;
                 oc_list_push_back(&results, &result->listElt);
             }
+            */
         }
     }
+
+    //NOTE: match againsts facts
+    results = bb_program_match_pattern_against_facts(arena, factDb, pattern);
 
     return results;
 }
@@ -2672,7 +2686,36 @@ bb_fact* bb_builtin_responder_point(oc_arena* arena, bb_facts_db* factDb, bb_val
                             if(test)
                             {
                                 pointer->whiskerBoldFrame[dirIndex] = factDb->frame;
-                                //TODO add a fact to the database and fill bindings
+
+                                //NOTE add a fact to the database, which will be picked up next iteration...
+                                oc_list list = { 0 };
+
+                                bb_value* pVal = oc_arena_push_type(arena, bb_value);
+                                pVal->kind = BB_VALUE_CARD_ID;
+                                pVal->valU64 = pointer->id;
+                                oc_list_push_back(&list, &pVal->parentElt);
+
+                                bb_value* pointsVal = oc_arena_push_type(arena, bb_value);
+                                pointsVal->kind = BB_VALUE_SYMBOL;
+                                pointsVal->string = OC_STR8("points");
+                                oc_list_push_back(&list, &pointsVal->parentElt);
+
+                                bb_value* dirVal = oc_arena_push_type(arena, bb_value);
+                                dirVal->kind = BB_VALUE_SYMBOL;
+                                dirVal->string = bb_direction_strings[dirIndex];
+                                oc_list_push_back(&list, &dirVal->parentElt);
+
+                                bb_value* atVal = oc_arena_push_type(arena, bb_value);
+                                atVal->kind = BB_VALUE_SYMBOL;
+                                atVal->string = OC_STR8("at");
+                                oc_list_push_back(&list, &atVal->parentElt);
+
+                                bb_value* qVal = oc_arena_push_type(arena, bb_value);
+                                qVal->kind = BB_VALUE_CARD_ID;
+                                qVal->valU64 = pointee->id;
+                                oc_list_push_back(&list, &qVal->parentElt);
+
+                                bb_fact_db_push(arena, factDb, list);
                             }
                         }
                     }
@@ -2981,7 +3024,7 @@ int main()
         },
         {
             .id = 8,
-            .rect = { 500, 400, 200, 300 },
+            .rect = { 500, 400, 400, 200 },
         },
     };
 
