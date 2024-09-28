@@ -66,7 +66,27 @@ typedef struct bb_card
     oc_rect displayRect;
 
     bb_cell* root;
+
+    oc_str8 label;
+    u32 labelFrame;
+
+    oc_color highlight;
+    u32 highlightFrame;
+
+    u32 whiskerFrame[4];
+    u32 whiskerBoldFrame[4];
 } bb_card;
+
+enum
+{
+    BB_WHISKER_DIRECTION_UP = 0,
+    BB_WHISKER_DIRECTION_LEFT,
+    BB_WHISKER_DIRECTION_DOWN,
+    BB_WHISKER_DIRECTION_RIGHT,
+    BB_WHISKER_DIRECTION_COUNT,
+};
+
+f32 BB_WHISKER_SIZE = 100;
 
 bool bb_cell_has_children(bb_cell* cell)
 {
@@ -1066,16 +1086,16 @@ typedef enum
 {
     BB_PREV,
     BB_NEXT
-} bb_direction;
+} bb_cursor_direction;
 
-void bb_move_one(bb_cell_editor* editor, bb_direction direction)
+void bb_move_one(bb_cell_editor* editor, bb_cursor_direction direction)
 {
     editor->cursor = (direction == BB_PREV)
                        ? bb_prev_point(editor->cursor)
                        : bb_next_point(editor->cursor);
 }
 
-void bb_move_vertical(bb_cell_editor* editor, bb_direction direction)
+void bb_move_vertical(bb_cell_editor* editor, bb_cursor_direction direction)
 {
     //NOTE(martin): intercept vertical moves if completion panel is focused
     /*
@@ -1129,7 +1149,7 @@ void bb_move_vertical(bb_cell_editor* editor, bb_direction direction)
     }
 }
 
-typedef void (*bb_move)(bb_cell_editor* editor, bb_direction direction);
+typedef void (*bb_move)(bb_cell_editor* editor, bb_cursor_direction direction);
 typedef void (*bb_action)(bb_cell_editor* editor);
 
 typedef struct bb_command
@@ -1139,7 +1159,7 @@ typedef struct bb_command
     oc_keymod_flags mods;
 
     bb_move move;
-    bb_direction direction;
+    bb_cursor_direction direction;
     bool setMark;
 
     bb_action action;
@@ -1994,14 +2014,24 @@ typedef struct bb_fact
 
 typedef struct bb_facts_db bb_facts_db;
 
-typedef void (*bb_responder_proc)(bb_value* match, oc_list bindings, bb_facts_db* factDb, oc_list cards);
+typedef void (*bb_listener_proc)(bb_value* match, oc_list bindings, bb_facts_db* factDb, oc_list cards);
+
+typedef struct bb_listener
+{
+    oc_list_elt listElt;
+    bb_value* pattern;
+    bb_listener_proc proc;
+    u32 lastRun;
+
+} bb_listener;
+
+typedef bb_fact* (*bb_responder_proc)(oc_arena* arena, bb_facts_db* factDb, bb_value* query, oc_list queryBindings, oc_list* factBindings);
 
 typedef struct bb_responder
 {
     oc_list_elt listElt;
     bb_value* pattern;
     bb_responder_proc proc;
-    u32 lastRun;
 
 } bb_responder;
 
@@ -2010,6 +2040,8 @@ typedef struct bb_facts_db
     u32 factCount;
     oc_list facts;
 
+    oc_list cards;
+    oc_list listeners;
     oc_list responders;
 
     u32 frame;
@@ -2253,6 +2285,7 @@ oc_list bb_program_match_pattern(oc_arena* arena, bb_facts_db* factDb, bb_value*
     //NOTE: returns a list of match results. Each contain the matched value, and associated bindings
     oc_list results = { 0 };
 
+    //NOTE: now match againsts facts
     oc_list_for(factDb->facts, fact, bb_fact, listElt)
     {
         oc_list bindings = { 0 };
@@ -2260,11 +2293,40 @@ oc_list bb_program_match_pattern(oc_arena* arena, bb_facts_db* factDb, bb_value*
         if(match)
         {
             bb_match_result* result = oc_arena_push_type(arena, bb_match_result);
+
             result->fact = fact;
             result->bindings = bindings;
             oc_list_push_back(&results, &result->listElt);
         }
     }
+
+    //NOTE: run the pattern against responders
+    /*
+        e.g. we have a query (when self points up at $x), we want it to match the responder ($p points $dir at $q)
+
+        -> so we match the pattern of the _responder_ against the query, which returns the query with ($p = self, $dir = up, $q = $x),
+        and call the responder routine with this. It should check which pages self points up to, and return
+        (self points up at card-id) with ($x = card-id)
+    */
+
+    oc_list_for(factDb->responders, responder, bb_responder, listElt)
+    {
+        oc_list responderBindings = { 0 };
+        bb_value* match = bb_program_match_pattern_against_value(arena, pattern, responder->pattern, &responderBindings);
+        if(match)
+        {
+            oc_list answerBindings = { 0 };
+            bb_fact* fact = responder->proc(arena, factDb, match, responderBindings, &answerBindings);
+            if(fact)
+            {
+                bb_match_result* result = oc_arena_push_type(arena, bb_match_result);
+                result->fact = fact;
+                result->bindings = answerBindings;
+                oc_list_push_back(&results, &result->listElt);
+            }
+        }
+    }
+
     return results;
 }
 
@@ -2363,7 +2425,7 @@ void bb_program_interpret_cell(oc_arena* arena, bb_facts_db* factDb, bb_card* ca
     factDb->iteration++;
 }
 
-void bb_builtin_responder_label(bb_value* match, oc_list bindings, bb_facts_db* factDb, oc_list cards)
+void bb_builtin_listener_label(bb_value* match, oc_list bindings, bb_facts_db* factDb, oc_list cards)
 {
     bb_value* p = bb_find_binding(bindings, OC_STR8("p"));
     bb_value* q = bb_find_binding(bindings, OC_STR8("q"));
@@ -2371,14 +2433,77 @@ void bb_builtin_responder_label(bb_value* match, oc_list bindings, bb_facts_db* 
 
     if(q && s && q->kind == BB_VALUE_CARD_ID && s->kind == BB_VALUE_STRING)
     {
-        printf("card-%llu is labeled %.*s\n", q->valU64, oc_str8_ip(s->string));
+        oc_list_for(cards, card, bb_card, listElt)
+        {
+            if(card->id == q->valU64)
+            {
+                card->label = s->string;
+                card->labelFrame = factDb->frame;
+            }
+        }
     }
 }
 
-void bb_program_init_builtin_responders(oc_arena* arena, bb_facts_db* factDb)
+typedef struct bb_color_entry
+{
+    oc_str8 string;
+    oc_color color;
+} bb_color_entry;
+
+const bb_color_entry bb_highlight_colors[] = {
+    {
+        OC_STR8_LIT("red"),
+        { 1, 0, 0, 1 },
+    },
+    {
+        OC_STR8_LIT("green"),
+        { 0, 1, 0, 1 },
+    },
+    {
+        OC_STR8_LIT("blue"),
+        { 0, 0, 1, 1 },
+    },
+};
+const u32 bb_highlight_color_count = sizeof(bb_highlight_colors) / sizeof(bb_color_entry);
+
+void bb_builtin_listener_highlight(bb_value* match, oc_list bindings, bb_facts_db* factDb, oc_list cards)
+{
+    bb_value* p = bb_find_binding(bindings, OC_STR8("p"));
+    bb_value* q = bb_find_binding(bindings, OC_STR8("q"));
+    bb_value* s = bb_find_binding(bindings, OC_STR8("s"));
+
+    if(q && s && q->kind == BB_VALUE_CARD_ID && s->kind == BB_VALUE_STRING)
+    {
+        oc_color color = { 0 };
+        bool found = false;
+        for(u32 i = 0; i < bb_highlight_color_count; i++)
+        {
+            if(!oc_str8_cmp(s->string, bb_highlight_colors[i].string))
+            {
+                color = bb_highlight_colors[i].color;
+                found = true;
+                break;
+            }
+        }
+
+        if(found)
+        {
+            oc_list_for(cards, card, bb_card, listElt)
+            {
+                if(card->id == q->valU64)
+                {
+                    card->highlight = color;
+                    card->highlightFrame = factDb->frame;
+                }
+            }
+        }
+    }
+}
+
+void bb_program_init_builtin_listeners(oc_arena* arena, bb_facts_db* factDb)
 {
     {
-        bb_responder* responder = oc_arena_push_type(arena, bb_responder);
+        bb_listener* listener = oc_arena_push_type(arena, bb_listener);
 
         bb_value* pattern = oc_arena_push_type(arena, bb_value);
         pattern->kind = BB_VALUE_LIST;
@@ -2413,28 +2538,188 @@ void bb_program_init_builtin_responders(oc_arena* arena, bb_facts_db* factDb)
         s->string = oc_str8_push_cstring(arena, "s");
         oc_list_push_back(&pattern->children, &s->parentElt);
 
-        responder->pattern = pattern;
-        responder->proc = bb_builtin_responder_label;
+        listener->pattern = pattern;
+        listener->proc = bb_builtin_listener_label;
 
-        oc_list_push_back(&factDb->responders, &responder->listElt);
+        oc_list_push_back(&factDb->listeners, &listener->listElt);
+    }
+
+    {
+        bb_listener* listener = oc_arena_push_type(arena, bb_listener);
+
+        bb_value* pattern = oc_arena_push_type(arena, bb_value);
+        pattern->kind = BB_VALUE_LIST;
+
+        bb_value* p = oc_arena_push_type(arena, bb_value);
+        p->kind = BB_VALUE_PLACEHOLDER;
+        p->string = oc_str8_push_cstring(arena, "p");
+        oc_list_push_back(&pattern->children, &p->parentElt);
+
+        bb_value* wishes = oc_arena_push_type(arena, bb_value);
+        wishes->kind = BB_VALUE_SYMBOL;
+        wishes->string = oc_str8_push_cstring(arena, "wishes");
+        oc_list_push_back(&pattern->children, &wishes->parentElt);
+
+        bb_value* q = oc_arena_push_type(arena, bb_value);
+        q->kind = BB_VALUE_PLACEHOLDER;
+        q->string = oc_str8_push_cstring(arena, "q");
+        oc_list_push_back(&pattern->children, &q->parentElt);
+
+        bb_value* is = oc_arena_push_type(arena, bb_value);
+        is->kind = BB_VALUE_SYMBOL;
+        is->string = oc_str8_push_cstring(arena, "is");
+        oc_list_push_back(&pattern->children, &is->parentElt);
+
+        bb_value* labeled = oc_arena_push_type(arena, bb_value);
+        labeled->kind = BB_VALUE_SYMBOL;
+        labeled->string = oc_str8_push_cstring(arena, "highlighted");
+        oc_list_push_back(&pattern->children, &labeled->parentElt);
+
+        bb_value* s = oc_arena_push_type(arena, bb_value);
+        s->kind = BB_VALUE_PLACEHOLDER;
+        s->string = oc_str8_push_cstring(arena, "s");
+        oc_list_push_back(&pattern->children, &s->parentElt);
+
+        listener->pattern = pattern;
+        listener->proc = bb_builtin_listener_highlight;
+
+        oc_list_push_back(&factDb->listeners, &listener->listElt);
     }
 }
 
-void bb_program_run_builtin_responders(oc_arena* arena, bb_facts_db* factDb, oc_list cards)
+void bb_program_run_builtin_listeners(oc_arena* arena, bb_facts_db* factDb, oc_list cards)
 {
-    oc_list_for(factDb->responders, responder, bb_responder, listElt)
+    oc_list_for(factDb->listeners, listener, bb_listener, listElt)
     {
-        oc_list matches = bb_program_match_pattern(arena, factDb, responder->pattern);
+        oc_list matches = bb_program_match_pattern(arena, factDb, listener->pattern);
 
         oc_list_for(matches, match, bb_match_result, listElt)
         {
-            if(match->fact->iteration > responder->lastRun)
+            if(match->fact->iteration > listener->lastRun)
             {
-                responder->proc(match->fact->root, match->bindings, factDb, cards);
+                listener->proc(match->fact->root, match->bindings, factDb, cards);
             }
         }
-        responder->lastRun = factDb->iteration;
+        listener->lastRun = factDb->iteration;
         factDb->iteration++;
+    }
+}
+
+oc_str8 bb_direction_strings[] = {
+    OC_STR8_LIT("up"),
+    OC_STR8_LIT("left"),
+    OC_STR8_LIT("down"),
+    OC_STR8_LIT("right"),
+};
+
+bb_fact* bb_builtin_responder_point(oc_arena* arena, bb_facts_db* factDb, bb_value* query, oc_list queryBindings, oc_list* factBindings)
+{
+    bb_value* p = bb_find_binding(queryBindings, OC_STR8("p"));
+    bb_value* dir = bb_find_binding(queryBindings, OC_STR8("dir"));
+    bb_value* q = bb_find_binding(queryBindings, OC_STR8("q"));
+
+    oc_list_for(factDb->cards, pointer, bb_card, listElt)
+    {
+        if(p->kind == BB_VALUE_PLACEHOLDER || (p->kind == BB_VALUE_CARD_ID && p->valU64 == pointer->id))
+        {
+            for(u32 dirIndex = 0; dirIndex < BB_WHISKER_DIRECTION_COUNT; dirIndex++)
+            {
+                if(dir->kind == BB_VALUE_PLACEHOLDER
+                   || (dir->kind == BB_VALUE_SYMBOL && !oc_str8_cmp(dir->string, bb_direction_strings[dirIndex])))
+                {
+                    pointer->whiskerFrame[dirIndex] = factDb->frame;
+
+                    oc_list_for(factDb->cards, pointee, bb_card, listElt)
+                    {
+                        if(q->kind == BB_VALUE_PLACEHOLDER || (q->kind == BB_VALUE_CARD_ID && q->valU64 == pointee->id))
+                        {
+                            oc_vec2 pCenter = {
+                                pointer->rect.x + pointer->rect.w / 2,
+                                pointer->rect.y + pointer->rect.h / 2,
+                            };
+                            oc_rect pRect = pointer->rect;
+                            oc_rect qRect = pointee->rect;
+
+                            bool test = false;
+                            switch(dirIndex)
+                            {
+                                case BB_WHISKER_DIRECTION_UP:
+                                    test = pCenter.x >= qRect.x
+                                        && pCenter.x <= (qRect.x + qRect.w)
+                                        && pRect.y - BB_WHISKER_SIZE >= qRect.y
+                                        && pRect.y - BB_WHISKER_SIZE <= (qRect.y + qRect.h);
+                                    break;
+                                case BB_WHISKER_DIRECTION_LEFT:
+                                    test = pCenter.y >= qRect.y
+                                        && pCenter.y <= (qRect.y + qRect.h)
+                                        && pRect.x - BB_WHISKER_SIZE >= qRect.x
+                                        && pRect.x - BB_WHISKER_SIZE <= (qRect.x + qRect.w);
+                                    break;
+                                case BB_WHISKER_DIRECTION_DOWN:
+                                    test = pCenter.x >= qRect.x
+                                        && pCenter.x <= (qRect.x + qRect.w)
+                                        && pRect.y + pRect.h + BB_WHISKER_SIZE >= qRect.y
+                                        && pRect.y + pRect.h + BB_WHISKER_SIZE <= (qRect.y + qRect.h);
+                                    break;
+                                case BB_WHISKER_DIRECTION_RIGHT:
+                                    test = pCenter.y >= qRect.y
+                                        && pCenter.y <= (qRect.y + qRect.h)
+                                        && pRect.x + pRect.w + BB_WHISKER_SIZE >= qRect.x
+                                        && pRect.x + pRect.w + BB_WHISKER_SIZE <= (qRect.x + qRect.w);
+                                    break;
+                            }
+
+                            if(test)
+                            {
+                                pointer->whiskerBoldFrame[dirIndex] = factDb->frame;
+                                //TODO add a fact to the database and fill bindings
+                            }
+                        }
+                    }
+                }
+            }
+        }
+    }
+    return 0;
+}
+
+void bb_program_init_builtin_responders(oc_arena* arena, bb_facts_db* factDb)
+{
+    {
+        bb_responder* responder = oc_arena_push_type(arena, bb_responder);
+
+        bb_value* pattern = oc_arena_push_type(arena, bb_value);
+        pattern->kind = BB_VALUE_LIST;
+
+        bb_value* p = oc_arena_push_type(arena, bb_value);
+        p->kind = BB_VALUE_PLACEHOLDER;
+        p->string = oc_str8_push_cstring(arena, "p");
+        oc_list_push_back(&pattern->children, &p->parentElt);
+
+        bb_value* points = oc_arena_push_type(arena, bb_value);
+        points->kind = BB_VALUE_SYMBOL;
+        points->string = oc_str8_push_cstring(arena, "points");
+        oc_list_push_back(&pattern->children, &points->parentElt);
+
+        bb_value* direction = oc_arena_push_type(arena, bb_value);
+        direction->kind = BB_VALUE_PLACEHOLDER;
+        direction->string = oc_str8_push_cstring(arena, "dir");
+        oc_list_push_back(&pattern->children, &direction->parentElt);
+
+        bb_value* at = oc_arena_push_type(arena, bb_value);
+        at->kind = BB_VALUE_SYMBOL;
+        at->string = oc_str8_push_cstring(arena, "at");
+        oc_list_push_back(&pattern->children, &at->parentElt);
+
+        bb_value* q = oc_arena_push_type(arena, bb_value);
+        q->kind = BB_VALUE_PLACEHOLDER;
+        q->string = oc_str8_push_cstring(arena, "q");
+        oc_list_push_back(&pattern->children, &q->parentElt);
+
+        responder->pattern = pattern;
+        responder->proc = bb_builtin_responder_point;
+
+        oc_list_push_back(&factDb->responders, &responder->listElt);
     }
 }
 
@@ -2443,13 +2728,14 @@ void bb_program_update(bb_facts_db* factDb, oc_list cards)
     factDb->facts = (oc_list){ 0 };
     factDb->factCount = 0;
     factDb->iteration = 1;
+    factDb->cards = cards;
 
     oc_arena_scope scratch = oc_scratch_begin();
 
-    //NOTE: reset built-in responders last run
-    oc_list_for(factDb->responders, responder, bb_responder, listElt)
+    //NOTE: reset built-in listeners last run
+    oc_list_for(factDb->listeners, listener, bb_listener, listElt)
     {
-        responder->lastRun = 0;
+        listener->lastRun = 0;
     }
 
     //NOTE: run until fixed point (i.e. until iteration doesn't generate any new facts)
@@ -2466,7 +2752,7 @@ void bb_program_update(bb_facts_db* factDb, oc_list cards)
             }
         }
 
-        bb_program_run_builtin_responders(scratch.arena, factDb, cards);
+        bb_program_run_builtin_listeners(scratch.arena, factDb, cards);
     }
     while(prevFactCount != factDb->factCount);
 
@@ -2513,6 +2799,105 @@ oc_font create_font()
     free(fontData);
     oc_scratch_end(scratch);
     return (font);
+}
+
+typedef struct bb_card_draw_proc_data
+{
+    bb_cell_editor* editor;
+    bb_card* card;
+    u32 frame;
+} bb_card_draw_proc_data;
+
+void bb_card_draw_proc(oc_ui_box* box, void* user)
+{
+    bb_card_draw_proc_data* data = (bb_card_draw_proc_data*)user;
+
+    const f32 fontSize = 42;
+    if(data->card->labelFrame == data->frame - 1)
+    {
+        oc_font_metrics fontMetrics = oc_font_get_metrics(data->editor->font, fontSize);
+        oc_text_metrics metrics = oc_font_text_metrics(data->editor->font, fontSize, data->card->label);
+        f32 x = data->card->rect.x + (data->card->rect.w - metrics.logical.w) / 2;
+        f32 y = data->card->rect.y + (data->card->rect.h - metrics.logical.h) / 2 + fontMetrics.ascent;
+
+        oc_move_to(x, y);
+        oc_set_font(data->editor->font);
+        oc_set_font_size(fontSize);
+        oc_set_color_rgba(1, 1, 1, 0.5);
+        oc_text_outlines(data->card->label);
+        oc_fill();
+    }
+    if(data->card->highlightFrame == data->frame - 1)
+    {
+        oc_color color = data->card->highlight;
+        color.a = 0.3;
+        oc_set_color(color);
+        oc_rounded_rectangle_fill(data->card->rect.x - 10,
+                                  data->card->rect.y - 10,
+                                  data->card->rect.w + 20,
+                                  data->card->rect.h + 20,
+                                  5 + 10);
+    }
+    for(u32 i = 0; i < BB_WHISKER_DIRECTION_COUNT; i++)
+    {
+        if(data->card->whiskerFrame[i] == data->frame - 1)
+        {
+            oc_rect rect = data->card->rect;
+
+            oc_set_color_rgba(0, 1, 0, 1);
+
+            if(data->card->whiskerBoldFrame[i] == data->frame - 1)
+            {
+                oc_set_width(2);
+            }
+            else
+            {
+                oc_set_width(1);
+            }
+
+            switch(i)
+            {
+                case BB_WHISKER_DIRECTION_UP:
+                    oc_move_to(rect.x + 0.2 * rect.w, rect.y - 5);
+                    oc_line_to(rect.x + 0.8 * rect.w, rect.y - 5);
+                    oc_stroke();
+                    oc_move_to(rect.x + rect.w / 2, rect.y - 5);
+                    oc_line_to(rect.x + rect.w / 2, rect.y - BB_WHISKER_SIZE + 5);
+                    oc_stroke();
+                    oc_circle_stroke(rect.x + rect.w / 2, rect.y - BB_WHISKER_SIZE, 5);
+                    break;
+                case BB_WHISKER_DIRECTION_LEFT:
+                    oc_move_to(rect.x - 5, rect.y + 0.2 * rect.h);
+                    oc_line_to(rect.x - 5, rect.y + 0.8 * rect.h);
+                    oc_stroke();
+                    oc_move_to(rect.x - 5, rect.y + rect.h / 2);
+                    oc_line_to(rect.x - BB_WHISKER_SIZE + 5, rect.y + rect.h / 2);
+                    oc_stroke();
+                    oc_circle_stroke(rect.x - BB_WHISKER_SIZE, rect.y + rect.h / 2, 5);
+                    break;
+                case BB_WHISKER_DIRECTION_DOWN:
+                    oc_move_to(rect.x + 0.2 * rect.w, rect.y + rect.h + 5);
+                    oc_line_to(rect.x + 0.8 * rect.w, rect.y + rect.h + 5);
+                    oc_stroke();
+                    oc_move_to(rect.x + rect.w / 2, rect.y + rect.h + 5);
+                    oc_line_to(rect.x + rect.w / 2, rect.y + rect.h + BB_WHISKER_SIZE - 5);
+                    oc_stroke();
+                    oc_circle_stroke(rect.x + rect.w / 2, rect.y + rect.h + BB_WHISKER_SIZE, 5);
+                    break;
+                case BB_WHISKER_DIRECTION_RIGHT:
+                    oc_move_to(rect.x + rect.w + 5, rect.y + 0.2 * rect.h);
+                    oc_line_to(rect.x + rect.w + 5, rect.y + 0.8 * rect.h);
+                    oc_stroke();
+                    oc_move_to(rect.x + rect.w + 5, rect.y + rect.h / 2);
+                    oc_line_to(rect.x + rect.w + BB_WHISKER_SIZE - 5, rect.y + rect.h / 2);
+                    oc_stroke();
+                    oc_circle_stroke(rect.x + rect.w + BB_WHISKER_SIZE, rect.y + rect.h / 2, 5);
+                    break;
+                default:
+                    break;
+            }
+        }
+    }
 }
 
 int main()
@@ -2627,9 +3012,6 @@ int main()
         .fontMetrics = metrics,
         .lineHeight = metrics.ascent + metrics.descent + metrics.lineGap,
         .spaceWidth = spaceMetrics.logical.w,
-
-        .editedCard = &cards[7],
-
         .nextCellId = 100,
     };
 
@@ -2642,7 +3024,7 @@ int main()
         cards[i].root->id = 0;
         cards[i].root->kind = BB_CELL_LIST;
     }
-
+    /*
     bb_cell* root = oc_arena_push_type(&editor.arena, bb_cell);
     memset(root, 0, sizeof(bb_cell));
     root->id = 0;
@@ -2702,9 +3084,11 @@ int main()
         .offset = 3,
     },
     editor.mark = editor.cursor;
+    */
 
-    bb_facts_db factDb = { 0 };
+    bb_facts_db factDb = { .frame = 2 };
 
+    bb_program_init_builtin_listeners(&editor.arena, &factDb);
     bb_program_init_builtin_responders(&editor.arena, &factDb);
 
     while(!oc_should_quit())
@@ -3011,11 +3395,35 @@ int main()
                                                          | OC_UI_FLAG_DRAW_BACKGROUND
                                                          | OC_UI_FLAG_DRAW_BORDER
                                                          | OC_UI_FLAG_CLICKABLE
-                                                         | OC_UI_FLAG_BLOCK_MOUSE)
+                                                         | OC_UI_FLAG_BLOCK_MOUSE
+                                                         | OC_UI_FLAG_DRAW_PROC)
                                 {
                                     oc_ui_label_str8(key);
                                     bb_card_draw_cells(scratch.arena, &editor, card);
                                 }
+
+                                oc_ui_style_next(&(oc_ui_style){
+                                                     .size = {
+                                                         .width = { OC_UI_SIZE_PIXELS, card->displayRect.w },
+                                                         .height = { OC_UI_SIZE_PIXELS, card->displayRect.h },
+                                                     },
+                                                     .floating = {
+                                                         .x = true,
+                                                         .y = true,
+                                                     },
+                                                     .floatTarget = { card->displayRect.x, card->displayRect.y },
+                                                 },
+                                                 OC_UI_STYLE_SIZE | OC_UI_STYLE_FLOAT);
+
+                                oc_str8 illumKey = oc_str8_pushf(scratch.arena, "illum-%llu", card->id);
+                                oc_ui_box* box = oc_ui_box_make_str8(illumKey, OC_UI_FLAG_DRAW_PROC);
+
+                                bb_card_draw_proc_data* data = oc_arena_push_type(scratch.arena, bb_card_draw_proc_data);
+                                data->card = card;
+                                data->frame = factDb.frame;
+                                data->editor = &editor;
+
+                                oc_ui_box_set_draw_proc(box, bb_card_draw_proc, data);
                             }
                         }
                     }
