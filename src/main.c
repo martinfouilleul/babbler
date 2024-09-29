@@ -2014,7 +2014,26 @@ typedef struct bb_fact
 
 typedef struct bb_facts_db bb_facts_db;
 
-typedef void (*bb_listener_proc)(bb_value* match, oc_list bindings, bb_facts_db* factDb, oc_list cards);
+typedef struct bb_bound_val
+{
+    oc_list_elt listElt;
+    oc_str8 name;
+    bb_value* value;
+} bb_bound_val;
+
+typedef struct bb_binding_scope
+{
+    oc_list_elt listElt;
+    oc_list bindings;
+
+} bb_binding_scope;
+
+typedef struct bb_bindings
+{
+    oc_list scopes;
+} bb_bindings;
+
+typedef void (*bb_listener_proc)(bb_value* match, bb_bindings* bindings, bb_facts_db* factDb, oc_list cards);
 
 typedef struct bb_listener
 {
@@ -2025,7 +2044,7 @@ typedef struct bb_listener
 
 } bb_listener;
 
-typedef bb_fact* (*bb_responder_proc)(oc_arena* arena, bb_facts_db* factDb, bb_value* query, oc_list queryBindings, oc_list* factBindings);
+typedef bb_fact* (*bb_responder_proc)(oc_arena* arena, bb_facts_db* factDb, bb_value* query, bb_bindings* queryBindings, oc_list* factBindings);
 
 typedef struct bb_responder
 {
@@ -2132,28 +2151,25 @@ void bb_debug_print_facts(bb_facts_db* factDb)
     }
 }
 
-typedef struct bb_binding
-{
-    oc_list_elt listElt;
-    oc_str8 name;
-    bb_value* value;
-} bb_binding;
-
-bb_value* bb_find_binding(oc_list bindings, oc_str8 name)
+bb_value* bb_find_binding(bb_bindings* bindings, oc_str8 name)
 {
     bb_value* value = 0;
-    oc_list_for(bindings, binding, bb_binding, listElt)
+
+    oc_list_for(bindings->scopes, scope, bb_binding_scope, listElt)
     {
-        if(!oc_str8_cmp(binding->name, name))
+        oc_list_for(scope->bindings, binding, bb_bound_val, listElt)
         {
-            value = binding->value;
-            break;
+            if(!oc_str8_cmp(binding->name, name))
+            {
+                value = binding->value;
+                break;
+            }
         }
     }
     return value;
 }
 
-bb_value* bb_program_eval_pattern(oc_arena* arena, bb_card* card, bb_cell* cell, oc_list bindings)
+bb_value* bb_program_eval_pattern(oc_arena* arena, bb_card* card, bb_cell* cell, bb_bindings* bindings)
 {
     bb_value* result = oc_arena_push_type(arena, bb_value);
     memset(result, 0, sizeof(bb_value));
@@ -2257,7 +2273,7 @@ bb_value* bb_program_match_pattern_against_value(oc_arena* arena, bb_value* valu
 
             case BB_VALUE_PLACEHOLDER:
             {
-                bb_binding* binding = oc_arena_push_type(arena, bb_binding);
+                bb_bound_val* binding = oc_arena_push_type(arena, bb_bound_val);
                 binding->name = pattern->string;
                 binding->value = value;
                 oc_list_push_back(bindings, &binding->listElt);
@@ -2325,7 +2341,14 @@ oc_list bb_program_match_pattern(oc_arena* arena, bb_facts_db* factDb, bb_value*
         if(match)
         {
             oc_list answerBindings = { 0 };
-            responder->proc(arena, factDb, match, responderBindings, &answerBindings);
+
+            bb_bindings bindings = { 0 };
+            bb_binding_scope scope = {
+                .bindings = responderBindings,
+            };
+            oc_list_push_front(&bindings.scopes, &scope.listElt);
+
+            responder->proc(arena, factDb, match, &bindings, &answerBindings);
             /*
             if(fact)
             {
@@ -2344,7 +2367,7 @@ oc_list bb_program_match_pattern(oc_arena* arena, bb_facts_db* factDb, bb_value*
     return results;
 }
 
-void bb_program_interpret_cell(oc_arena* arena, bb_facts_db* factDb, bb_card* card, bb_cell* cell, oc_list bindings)
+void bb_program_interpret_cell(oc_arena* arena, bb_facts_db* factDb, bb_card* card, bb_cell* cell, bb_bindings* bindings)
 {
     if(cell->kind == BB_CELL_LIST && !oc_list_empty(cell->children))
     {
@@ -2418,7 +2441,12 @@ void bb_program_interpret_cell(oc_arena* arena, bb_facts_db* factDb, bb_card* ca
                                 child != 0;
                                 child = oc_list_next_entry(child, bb_cell, parentElt))
                             {
-                                bb_program_interpret_cell(arena, factDb, card, child, match->bindings);
+                                bb_binding_scope scope = {
+                                    .bindings = match->bindings,
+                                };
+                                oc_list_push_front(&bindings->scopes, &scope.listElt);
+                                bb_program_interpret_cell(arena, factDb, card, child, bindings);
+                                oc_list_pop_front(&bindings->scopes);
                             }
                         }
                     }
@@ -2430,7 +2458,7 @@ void bb_program_interpret_cell(oc_arena* arena, bb_facts_db* factDb, bb_card* ca
     factDb->iteration++;
 }
 
-void bb_builtin_listener_label(bb_value* match, oc_list bindings, bb_facts_db* factDb, oc_list cards)
+void bb_builtin_listener_label(bb_value* match, bb_bindings* bindings, bb_facts_db* factDb, oc_list cards)
 {
     bb_value* p = bb_find_binding(bindings, OC_STR8("p"));
     bb_value* q = bb_find_binding(bindings, OC_STR8("q"));
@@ -2471,7 +2499,7 @@ const bb_color_entry bb_highlight_colors[] = {
 };
 const u32 bb_highlight_color_count = sizeof(bb_highlight_colors) / sizeof(bb_color_entry);
 
-void bb_builtin_listener_highlight(bb_value* match, oc_list bindings, bb_facts_db* factDb, oc_list cards)
+void bb_builtin_listener_highlight(bb_value* match, bb_bindings* bindings, bb_facts_db* factDb, oc_list cards)
 {
     bb_value* p = bb_find_binding(bindings, OC_STR8("p"));
     bb_value* q = bb_find_binding(bindings, OC_STR8("q"));
@@ -2602,7 +2630,13 @@ void bb_program_run_builtin_listeners(oc_arena* arena, bb_facts_db* factDb, oc_l
         {
             if(match->fact->iteration > listener->lastRun)
             {
-                listener->proc(match->fact->root, match->bindings, factDb, cards);
+                bb_bindings bindings = { 0 };
+                bb_binding_scope scope = {
+                    .bindings = match->bindings,
+                };
+                oc_list_push_front(&bindings.scopes, &scope.listElt);
+
+                listener->proc(match->fact->root, &bindings, factDb, cards);
             }
         }
         listener->lastRun = factDb->iteration;
@@ -2617,7 +2651,7 @@ oc_str8 bb_direction_strings[] = {
     OC_STR8_LIT("right"),
 };
 
-bb_fact* bb_builtin_responder_point(oc_arena* arena, bb_facts_db* factDb, bb_value* query, oc_list queryBindings, oc_list* factBindings)
+bb_fact* bb_builtin_responder_point(oc_arena* arena, bb_facts_db* factDb, bb_value* query, bb_bindings* queryBindings, oc_list* factBindings)
 {
     bb_value* p = bb_find_binding(queryBindings, OC_STR8("p"));
     bb_value* dir = bb_find_binding(queryBindings, OC_STR8("dir"));
@@ -2780,9 +2814,13 @@ void bb_program_update(bb_facts_db* factDb, oc_list cards)
 
         oc_list_for(cards, card, bb_card, listElt)
         {
+            bb_bindings bindings = { 0 };
+            bb_binding_scope scope = { 0 };
+            oc_list_push_front(&bindings.scopes, &scope.listElt);
+
             oc_list_for(card->root->children, cell, bb_cell, parentElt)
             {
-                bb_program_interpret_cell(scratch.arena, factDb, card, cell, (oc_list){ 0 });
+                bb_program_interpret_cell(scratch.arena, factDb, card, cell, &bindings);
             }
         }
 
