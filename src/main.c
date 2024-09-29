@@ -2414,20 +2414,11 @@ void bb_program_interpret_cell(oc_arena* arena, bb_facts_db* factDb, bb_card* ca
                     {
                         oc_list_for(matches, match, bb_match_result, listElt)
                         {
-                            if(match->fact->iteration > cell->lastRun)
+                            for(bb_cell* child = oc_list_next_entry(patternCell, bb_cell, parentElt);
+                                child != 0;
+                                child = oc_list_next_entry(child, bb_cell, parentElt))
                             {
-                                //DEBUG
-                                printf("matched fact: ");
-                                bb_debug_print_value(match->fact->root);
-                                printf("\n");
-
-                                //TODO: interpret with bindings
-                                for(bb_cell* child = oc_list_next_entry(patternCell, bb_cell, parentElt);
-                                    child != 0;
-                                    child = oc_list_next_entry(child, bb_cell, parentElt))
-                                {
-                                    bb_program_interpret_cell(arena, factDb, card, child, match->bindings);
-                                }
+                                bb_program_interpret_cell(arena, factDb, card, child, match->bindings);
                             }
                         }
                     }
