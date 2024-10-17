@@ -1,9 +1,9 @@
 #!/bin/bash
 
 BINDIR=bin
-ORCA_LIB=../Orca/build/bin
-ORCA_SRC=../Orca/src
-RESDIR=../resources
+ORCA_DIR=$(orca sdk-path)
+ORCA_LIB=$ORCA_DIR/bin
+ORCA_SRC=$ORCA_DIR/src
 
 
 INCLUDES="-I$ORCA_SRC"
