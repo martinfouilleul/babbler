@@ -79,6 +79,8 @@ typedef struct bb_card
     u32 whiskerBoldFrame[4];
 
     oc_list variables;
+
+    u64 clickedFrame;
 } bb_card;
 
 enum
@@ -693,7 +695,8 @@ void bb_insert_string_literal(bb_cell_editor* editor)
     X(KW_SET, "set")
 
 #define BB_TOKEN_OPERATORS(X) \
-    X(OP_ADD, "+")
+    X(OP_ADD, "+")            \
+    X(OP_SUB, "-")
 
 enum
 {
@@ -1090,6 +1093,51 @@ void bb_delete(bb_cell_editor* editor)
     }
 }
 
+//------------------------------------------------------------------------------------
+// Parenthesize
+//------------------------------------------------------------------------------------
+
+void bb_parenthesize_span(bb_cell_editor* editor)
+{
+    bb_cell_span span = { editor->cursor.leftFrom, editor->cursor.leftFrom };
+
+    if(!bb_point_same_cell(editor->cursor, editor->mark))
+    {
+        //NOTE(martin): multiple nodes are selected, highlight the selection (in blue)
+        span = bb_cell_span_from_points(editor->cursor, editor->mark);
+    }
+
+    if(span.start)
+    {
+        bb_cell* listCell = bb_cell_alloc(editor, BB_CELL_LIST);
+
+        editor->cursor = (bb_point){ span.start->parent, span.start, 0 };
+        bb_insert_at_cursor(editor, listCell);
+
+        bb_cell* child = span.start;
+        bb_cell* end = bb_cell_next_sibling(span.end);
+
+        while(child != end)
+        {
+            bb_cell* next = bb_cell_next_sibling(child);
+            child->parent->childCount--;
+            oc_list_remove(&child->parent->children, &child->parentElt);
+            bb_cell_push(listCell, child);
+            listCell->childCount++;
+
+            child = next;
+        }
+
+        editor->cursor.parent = listCell->parent;
+        editor->cursor.leftFrom = listCell;
+    }
+    else
+    {
+        bb_insert_list(editor);
+    }
+    editor->mark = editor->cursor;
+}
+
 //------------------------------------------------------------------------------------------
 // Moves
 //------------------------------------------------------------------------------------------
@@ -1293,16 +1341,16 @@ const bb_command BB_COMMANDS[] = {
 		.updateCompletion = true,
 		.focusCursor = true,
 	},
+*/
+    {
+        .key = OC_KEY_5,
+        .mods = OC_KEYMOD_CMD,
+        .action = bb_parenthesize_span,
+        .rebuild = true,
+        .updateCompletion = true,
+        .focusCursor = true,
+    },
 
-	{
-		.key = OC_KEY_5,
-		.mods = OC_KEYMOD_CMD,
-		.action = bb_parenthesize_span,
-		.rebuild = true,
-		.updateCompletion = true,
-		.focusCursor = true,
-	},
-    */
     //NOTE(martin): deletion
     {
         .key = OC_KEY_BACKSPACE,
@@ -2153,6 +2201,53 @@ void bb_debug_print_value(bb_value* value)
     }
 }
 
+oc_str8 bb_debug_value_to_str8(oc_arena* arena, bb_value* value)
+{
+    oc_str8 str = { 0 };
+    switch(value->kind)
+    {
+        case BB_VALUE_SYMBOL:
+        case BB_VALUE_PLACEHOLDER:
+            str = oc_str8_pushf(arena, "%.*s", oc_str8_ip(value->string));
+            break;
+
+        case BB_VALUE_STRING:
+            str = oc_str8_pushf(arena, "\"%.*s\"", oc_str8_ip(value->string));
+            break;
+
+        case BB_VALUE_U64:
+            str = oc_str8_pushf(arena, "%llu", value->valU64);
+            break;
+
+        case BB_VALUE_F64:
+            str = oc_str8_pushf(arena, "%f", value->valF64);
+            break;
+
+        case BB_VALUE_CARD_ID:
+            str = oc_str8_pushf(arena, "card-%llu", value->valU64);
+            break;
+
+        case BB_VALUE_LIST:
+        {
+            oc_str8_list list = { 0 };
+
+            oc_str8_list_pushf(arena, &list, "(");
+            oc_list_for(value->children, child, bb_value, parentElt)
+            {
+                oc_str8_list_push(arena, &list, bb_debug_value_to_str8(arena, child));
+                if(child->parentElt.next)
+                {
+                    oc_str8_list_pushf(arena, &list, " ");
+                }
+            }
+            oc_str8_list_pushf(arena, &list, ")");
+            str = oc_str8_list_join(arena, list);
+        }
+        break;
+    }
+    return (str);
+}
+
 void bb_debug_print_facts(bb_facts_db* factDb)
 {
     printf("Facts:\n");
@@ -2213,15 +2308,16 @@ bb_value* bb_program_eval_pattern(oc_arena* arena, bb_card* card, bb_cell* cell,
         bb_cell* head = oc_list_first_entry(cell->children, bb_cell, parentElt);
         if(head && head->kind == BB_CELL_OPERATOR)
         {
-            if(head->valU64 == BB_TOKEN_OP_ADD)
+            if(head->valU64 == BB_TOKEN_OP_ADD
+               || head->valU64 == BB_TOKEN_OP_SUB)
             {
                 bb_cell* lhsCell = oc_list_next_entry(head, bb_cell, parentElt);
                 if(lhsCell)
                 {
+                    bb_value* lhs = bb_program_eval_pattern(arena, card, lhsCell, bindings);
                     bb_cell* rhsCell = oc_list_next_entry(lhsCell, bb_cell, parentElt);
                     if(rhsCell)
                     {
-                        bb_value* lhs = bb_program_eval_pattern(arena, card, lhsCell, bindings);
                         bb_value* rhs = bb_program_eval_pattern(arena, card, rhsCell, bindings);
 
                         if(lhs->kind == BB_VALUE_F64 || rhs->kind == BB_VALUE_F64)
@@ -2237,12 +2333,39 @@ bb_value* bb_program_eval_pattern(oc_arena* arena, bb_card* card, bb_cell* cell,
                                 rhsValue = (f64)rhs->valU64;
                             }
                             result->kind = BB_VALUE_F64;
-                            result->valU64 = lhsValue + rhsValue;
+                            if(head->valU64 == BB_TOKEN_OP_ADD)
+                            {
+                                result->valU64 = lhsValue + rhsValue;
+                            }
+                            else
+                            {
+                                result->valU64 = lhsValue - rhsValue;
+                            }
                         }
                         else
                         {
                             result->kind = BB_VALUE_U64;
-                            result->valU64 = lhs->valU64 + rhs->valU64;
+                            if(head->valU64 == BB_TOKEN_OP_ADD)
+                            {
+                                result->valU64 = lhs->valU64 + rhs->valU64;
+                            }
+                            else
+                            {
+                                result->valU64 = lhs->valU64 - rhs->valU64;
+                            }
+                        }
+                    }
+                    else if(head->valU64 == BB_TOKEN_OP_SUB)
+                    {
+                        if(lhs->kind == BB_VALUE_F64)
+                        {
+                            result->kind = BB_VALUE_F64;
+                            result->valF64 = -lhs->valF64;
+                        }
+                        else
+                        {
+                            result->kind = BB_VALUE_U64;
+                            result->valU64 = -lhs->valU64;
                         }
                     }
                 }
@@ -2571,9 +2694,15 @@ void bb_program_interpret_cell(oc_arena* arena, bb_facts_db* factDb, bb_card* ca
                     if(valCell && valCell->lastEdit == factDb->frame)
                     {
                         bb_value* val = bb_program_eval_pattern(arena, card, valCell, bindings);
-                        if(val->kind == BB_VALUE_U64 || val->kind == BB_VALUE_F64 || val->kind == BB_VALUE_STRING)
+                        if(val->kind == BB_VALUE_U64 || val->kind == BB_VALUE_F64)
                         {
                             variable->storedValue = *val;
+                        }
+                        else if(val->kind == BB_VALUE_STRING)
+                        {
+                            //WARN: leak like there's no tomorrow
+                            variable->value->kind = BB_VALUE_STRING;
+                            variable->value->string = oc_str8_push_copy(&factDb->persistentArena, val->string);
                         }
                     }
 
@@ -2614,14 +2743,29 @@ void bb_builtin_listener_label(bb_value* match, bb_bindings* bindings, bb_facts_
     bb_value* q = bb_find_binding(bindings, OC_STR8("q"));
     bb_value* s = bb_find_binding(bindings, OC_STR8("s"));
 
-    if(q && s && q->kind == BB_VALUE_CARD_ID && s->kind == BB_VALUE_STRING)
+    if(q && s && q->kind == BB_VALUE_CARD_ID)
     {
         oc_list_for(cards, card, bb_card, listElt)
         {
             if(card->id == q->valU64)
             {
-                card->label = s->string;
-                card->labelFrame = factDb->frame;
+                if(s->kind == BB_VALUE_STRING)
+                {
+                    card->label = s->string;
+                    card->labelFrame = factDb->frame;
+                }
+                else if(s->kind == BB_VALUE_U64)
+                {
+                    //WARN: leak 'til the sun explodes
+                    card->label = oc_str8_pushf(&factDb->persistentArena, "%lli", s->valU64);
+                    card->labelFrame = factDb->frame;
+                }
+                else if(s->kind == BB_VALUE_F64)
+                {
+                    //WARN: leak 'til the sun explodes
+                    card->label = oc_str8_pushf(&factDb->persistentArena, "%f", s->valF64);
+                    card->labelFrame = factDb->frame;
+                }
             }
         }
     }
@@ -2645,6 +2789,22 @@ const bb_color_entry bb_highlight_colors[] = {
     {
         OC_STR8_LIT("blue"),
         { 0, 0, 1, 1 },
+    },
+    {
+        OC_STR8_LIT("yellow"),
+        { 1, 1, 0, 1 },
+    },
+    {
+        OC_STR8_LIT("cyan"),
+        { 0, 1, 1, 1 },
+    },
+    {
+        OC_STR8_LIT("magenta"),
+        { 1, 0, 1, 1 },
+    },
+    {
+        OC_STR8_LIT("orange"),
+        { 1, 0.647, 0, 1, OC_COLOR_SPACE_SRGB },
     },
 };
 const u32 bb_highlight_color_count = sizeof(bb_highlight_colors) / sizeof(bb_color_entry);
@@ -2901,6 +3061,40 @@ bb_fact* bb_builtin_responder_point(oc_arena* arena, bb_facts_db* factDb, bb_val
     return 0;
 }
 
+bb_fact* bb_builtin_responder_clicked(oc_arena* arena, bb_facts_db* factDb, bb_value* query, bb_bindings* queryBindings, oc_list* factBindings)
+{
+    bb_value* p = bb_find_binding(queryBindings, OC_STR8("p"));
+
+    oc_list_for(factDb->cards, card, bb_card, listElt)
+    {
+        if(p->kind == BB_VALUE_PLACEHOLDER || (p->kind == BB_VALUE_CARD_ID && p->valU64 == card->id))
+        {
+            if(card->clickedFrame == factDb->frame)
+            {
+                oc_list list = { 0 };
+
+                bb_value* pVal = oc_arena_push_type(arena, bb_value);
+                pVal->kind = BB_VALUE_CARD_ID;
+                pVal->valU64 = card->id;
+                oc_list_push_back(&list, &pVal->parentElt);
+
+                bb_value* isVal = oc_arena_push_type(arena, bb_value);
+                isVal->kind = BB_VALUE_SYMBOL;
+                isVal->string = OC_STR8("is");
+                oc_list_push_back(&list, &isVal->parentElt);
+
+                bb_value* clickedVal = oc_arena_push_type(arena, bb_value);
+                clickedVal->kind = BB_VALUE_SYMBOL;
+                clickedVal->string = OC_STR8("clicked");
+                oc_list_push_back(&list, &clickedVal->parentElt);
+
+                bb_fact_db_push(arena, factDb, list);
+            }
+        }
+    }
+    return 0;
+}
+
 void bb_program_init_builtin_responders(oc_arena* arena, bb_facts_db* factDb)
 {
     {
@@ -2939,9 +3133,43 @@ void bb_program_init_builtin_responders(oc_arena* arena, bb_facts_db* factDb)
 
         oc_list_push_back(&factDb->responders, &responder->listElt);
     }
+
+    {
+        bb_responder* responder = oc_arena_push_type(arena, bb_responder);
+
+        bb_value* pattern = oc_arena_push_type(arena, bb_value);
+        pattern->kind = BB_VALUE_LIST;
+
+        bb_value* p = oc_arena_push_type(arena, bb_value);
+        p->kind = BB_VALUE_PLACEHOLDER;
+        p->string = oc_str8_push_cstring(arena, "p");
+        oc_list_push_back(&pattern->children, &p->parentElt);
+
+        bb_value* is = oc_arena_push_type(arena, bb_value);
+        is->kind = BB_VALUE_SYMBOL;
+        is->string = oc_str8_push_cstring(arena, "is");
+        oc_list_push_back(&pattern->children, &is->parentElt);
+
+        bb_value* clicked = oc_arena_push_type(arena, bb_value);
+        clicked->kind = BB_VALUE_SYMBOL;
+        clicked->string = oc_str8_push_cstring(arena, "clicked");
+        oc_list_push_back(&pattern->children, &clicked->parentElt);
+
+        responder->pattern = pattern;
+        responder->proc = bb_builtin_responder_clicked;
+
+        oc_list_push_back(&factDb->responders, &responder->listElt);
+    }
 }
 
-void bb_program_update(oc_arena* frameArena, bb_facts_db* factDb, oc_list cards)
+typedef struct bb_program_stats
+{
+    u64 frame;
+    u64 iterations;
+    f64 duration;
+} bb_program_stats;
+
+bb_program_stats bb_program_update(oc_arena* frameArena, bb_facts_db* factDb, oc_list cards)
 {
     factDb->facts = (oc_list){ 0 };
     factDb->factCount = 0;
@@ -2955,7 +3183,10 @@ void bb_program_update(oc_arena* frameArena, bb_facts_db* factDb, oc_list cards)
     }
 
     //NOTE: run until fixed point (i.e. until iteration doesn't generate any new facts)
+    u32 itCount = 0;
     u32 prevFactCount = 0;
+
+    f64 start = oc_clock_time(OC_CLOCK_MONOTONIC);
     do
     {
         prevFactCount = factDb->factCount;
@@ -2973,12 +3204,23 @@ void bb_program_update(oc_arena* frameArena, bb_facts_db* factDb, oc_list cards)
         }
 
         bb_program_run_builtin_listeners(frameArena, factDb, cards);
+
+        itCount++;
     }
     while(prevFactCount != factDb->factCount);
 
-    bb_debug_print_facts(factDb);
+    f32 duration = oc_clock_time(OC_CLOCK_MONOTONIC) - start;
+
+    //    bb_debug_print_facts(factDb);
+    //printf("Fix point reached in %u iterations and %f seconds\n", itCount, duration);
 
     factDb->frame++;
+
+    return ((bb_program_stats){
+        .frame = factDb->frame - 1,
+        .iterations = itCount,
+        .duration = duration,
+    });
 }
 
 //------------------------------------------------------------------------------------------------
@@ -3121,7 +3363,7 @@ int main()
 {
     oc_init();
 
-    oc_rect windowRect = { .x = 100, .y = 100, .w = 1200, .h = 800 };
+    oc_rect windowRect = { .x = 100, .y = 100, .w = 1600, .h = 900 };
     oc_window window = oc_window_create(windowRect, OC_STR8("Babbler"), 0);
 
     oc_rect contentRect = oc_window_get_content_rect(window);
@@ -3249,6 +3491,8 @@ int main()
     bb_program_init_builtin_listeners(&editor.arena, &factDb);
     bb_program_init_builtin_responders(&editor.arena, &factDb);
 
+    bool showDatabase = false;
+
     while(!oc_should_quit())
     {
         oc_arena_scope scratch = oc_scratch_begin();
@@ -3269,6 +3513,10 @@ int main()
 
                 case OC_EVENT_KEYBOARD_KEY:
                 {
+                    if(event->key.action == OC_KEY_PRESS && event->key.keyCode == OC_KEY_D && (event->key.mods & OC_KEYMOD_CMD))
+                    {
+                        showDatabase = !showDatabase;
+                    }
                 }
                 break;
 
@@ -3278,7 +3526,7 @@ int main()
         }
 
         //NOTE(martin): update program
-        bb_program_update(scratch.arena, &factDb, activeList);
+        bb_program_stats stats = bb_program_update(scratch.arena, &factDb, activeList);
 
         editor.frame = factDb.frame;
 
@@ -3453,8 +3701,11 @@ int main()
                             if(box)
                             {
                                 oc_ui_sig sig = oc_ui_box_sig(box);
+
                                 if(sig.pressed)
                                 {
+                                    card->clickedFrame = factDb.frame;
+
                                     if(fabs(sig.mouse.x) < 10)
                                     {
                                         resizing |= RESIZE_LEFT;
@@ -3539,7 +3790,7 @@ int main()
                                                          .y = true,
                                                      },
                                                      .floatTarget = { card->displayRect.x, card->displayRect.y },
-                                                     .bgColor = OC_UI_DARK_THEME.bg0,
+                                                     .bgColor = OC_UI_DARK_THEME.bg2,
                                                      .borderColor = OC_UI_DARK_THEME.bg1,
                                                      .borderSize = 2,
                                                      .roundness = 5,
@@ -3649,7 +3900,7 @@ int main()
                                                      },
                                                      .floating = { true, true },
                                                      .floatTarget = { card->displayRect.x, card->displayRect.y },
-                                                     .bgColor = OC_UI_DARK_THEME.bg0,
+                                                     .bgColor = OC_UI_DARK_THEME.bg2,
                                                      .borderColor = OC_UI_DARK_THEME.bg1,
                                                      .borderSize = 2,
                                                      .roundness = 5,
@@ -3694,8 +3945,8 @@ int main()
 
                     oc_vec2 mousePos = oc_mouse_position(&ui.input);
 
-                    bool thumbnailed = (mousePos.x < SIDE_PANEL_WIDTH)
-                                    || (mousePos.x > frameSize.x - SIDE_PANEL_WIDTH);
+                    bool thumbnailed = (mousePos.x < SIDE_PANEL_WIDTH);
+                    //  || (mousePos.x > frameSize.x - SIDE_PANEL_WIDTH);
 
                     //TODO: convert to panel content coordinates, and compute where in the list to insert placeholder
                     // code up there must display it there
@@ -3723,7 +3974,7 @@ int main()
                                              .y = true,
                                          },
                                          .floatTarget = { dragging->displayRect.x, dragging->displayRect.y },
-                                         .bgColor = OC_UI_DARK_THEME.bg0,
+                                         .bgColor = OC_UI_DARK_THEME.bg2,
                                          .borderColor = OC_UI_DARK_THEME.bg1,
                                          .borderSize = 2,
                                          .roundness = 5,
@@ -3779,8 +4030,7 @@ int main()
                 {
                     oc_vec2 mousePos = oc_mouse_position(&ui.input);
 
-                    bool thumbnailed = (mousePos.x < SIDE_PANEL_WIDTH)
-                                    || (mousePos.x > frameSize.x - SIDE_PANEL_WIDTH);
+                    bool thumbnailed = (mousePos.x < SIDE_PANEL_WIDTH);
 
                     if(card != dragging || !thumbnailed)
                     {
@@ -3821,6 +4071,57 @@ int main()
         }
 
         oc_ui_draw();
+
+        if(showDatabase)
+        {
+            f32 startX = SIDE_PANEL_WIDTH + 40;
+            oc_vec2 pos = { startX, 40 };
+            oc_move_to(pos.x, pos.y);
+
+            oc_set_font(editor.font);
+            oc_set_font_size(editor.fontSize);
+            oc_set_color_rgba(1, 1, 1, 1);
+
+            oc_str8 str = oc_str8_pushf(scratch.arena,
+                                        "Frame: %llu, reached fixed point in %llu iteration%s / %.3f ms.",
+                                        stats.frame,
+                                        stats.iterations,
+                                        stats.iterations > 1 ? "s" : "",
+                                        stats.duration * 1000.);
+            oc_text_outlines(str);
+            pos.y += editor.lineHeight;
+            oc_move_to(pos.x, pos.y);
+
+            if(!oc_list_empty(factDb.facts))
+            {
+                oc_text_outlines(OC_STR8("Facts:\n"));
+
+                pos.y += editor.lineHeight;
+                oc_move_to(pos.x, pos.y);
+
+                i32 factIndex = 0;
+                oc_list_for(factDb.facts, fact, bb_fact, listElt)
+                {
+                    oc_str8 str = oc_str8_pushf(scratch.arena, "  fact #%i:", factIndex);
+                    oc_text_outlines(str);
+
+                    str = bb_debug_value_to_str8(scratch.arena, fact->root);
+                    oc_text_outlines(OC_STR8("    "));
+                    oc_text_outlines(str);
+
+                    pos.y += editor.lineHeight;
+                    oc_move_to(pos.x, pos.y);
+
+                    factIndex++;
+                }
+            }
+            else
+            {
+                oc_text_outlines(OC_STR8("No facts."));
+            }
+            oc_set_color_srgba(1, 0.843, 0, 1);
+            oc_fill();
+        }
 
         oc_canvas_render(renderer, context, surface);
         oc_canvas_present(renderer, surface);
